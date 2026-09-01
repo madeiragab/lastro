@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Bancos e logs gerados em testes locais
+*.lastro
+*.wal
+
+# Rascunhos de divulgação, não fazem parte do projeto
+/docs/post-linkedin.md
