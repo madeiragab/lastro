@@ -156,6 +156,21 @@ and it is what keeps recovery from rereading the entire log.
 
 Trigger: every 64 MB of log written, or every 30 seconds, whichever comes first.
 
+### Implementation deviation: a sharp checkpoint, not a fuzzy one
+
+The checkpoint as implemented **stops the world** while it runs: it forces every dirty page to
+disk, syncs the data file, then truncates the log to nothing. There are no `CHECKPOINT_BEGIN` and
+`CHECKPOINT_END` records — they are unnecessary once the log is emptied, because recovery always
+starts at byte zero of a short log.
+
+What is given up: under load, the database pauses for the duration. What is gained: the analysis
+pass need not rebuild an active transaction table or a dirty page table from a checkpoint,
+because nothing precedes it. Less code, less to get wrong, and recovery time is still bounded by
+how often the checkpoint runs.
+
+A fuzzy checkpoint is the natural next step, and is recorded as future work rather than as an
+omission.
+
 ---
 
 ## Recovery: the three passes
