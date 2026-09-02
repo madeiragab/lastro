@@ -14,8 +14,8 @@ line, what a database does between your `INSERT` and the data being safe on disk
 
 ## Status
 
-Under construction. Nothing here is stable, and the result tables are empty on purpose — a
-number only goes in after it has been measured.
+Under construction. Nothing here is stable. Every number in the result tables was measured,
+with the command to reproduce it alongside; none was estimated.
 
 | Layer | State |
 |---|---|
@@ -35,13 +35,13 @@ number only goes in after it has been measured.
 | MVCC: dead version collection (`VACUUM`) | done |
 | Proof: model, property, crash fuzzer | done |
 | Proof: anomaly battery | done |
-| Proof: sqllogictest, benchmark against SQLite | not started |
+| Proof: sqllogictest, benchmark against SQLite | done |
 
 What already runs: creating and opening a `.lastro` file, allocating and freeing pages with
 freelist reuse, storing variable-length cells in slotted pages with compaction, a B+Tree index
 with splitting and merging on top of that, a write-ahead log with full ARIES recovery, and a SQL
-layer with `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT` with joins, `UPDATE`, `DELETE` and
-`EXPLAIN`.
+layer with `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT` with joins, `DISTINCT` and
+`ORDER BY`, `UPDATE`, `DELETE`, `VACUUM` and `EXPLAIN`.
 
 A committed transaction survives a crash that lost its page, and an uncommitted one is reversed
 even if its page already reached disk. The WAL rule sits in the buffer pool's eviction path: no
@@ -235,13 +235,39 @@ data survives, the WAL rule is never put under pressure, and the test passes whe
 rule is even there. What is modelled is the thing that actually matters — **only what was
 `fsync`ed survives.**
 
-**Compatibility** — SQLite's SQL Logic Test suite, written by third parties, run against the
-SQL subset implemented here.
+**Compatibility** — the sqllogictest corpus, written by the SQLite project years before this one
+existed. Every other test here was written by the same person who wrote the code under test, which
+is the weakest kind of evidence there is: it only proves the engine does what its author expected.
+This corpus has no idea what lastro finds easy.
 
-| Metric | Value |
+| Measure | Value |
 |---|---|
-| Tests run | pending |
-| Passed | pending |
+| Files considered | 11 |
+| Files run to the end | 6 |
+| Files abandoned at setup | 5 |
+| Assertions attempted | 9,172 |
+| Passed | **9,172** |
+| Failed | **0** |
+| Skipped, feature not implemented | 16,924 |
+
+**100.0% of what ran. And 35.1% of the corpus could run at all.** The two numbers travel together
+on purpose: publishing "100% pass" while hiding that two thirds of the assertions were never
+attempted would be a statistical lie. The denominator ships with the numerator, every time.
+
+A missing feature is **not** a failure — it is an absence, and each one is listed with how often
+the corpus asked for it. The largest: function calls (6,243), `SELECT` with no `FROM` (4,577),
+comma-separated `SELECT` over several tables (1,970), scalar subqueries (1,149), `CROSS JOIN`
+(237), `EXISTS` (179). Five files stop at their `CREATE`, over `INSERT ... SELECT` and
+`CREATE TRIGGER`.
+
+Reproduce: `LASTRO_SQLLOGIC_DIR=<dir> cargo test --release --test sqllogic -- --nocapture`. The
+corpus is **fetched by CI rather than vendored** — evidence a repository carries around is
+evidence that repository can edit.
+
+The corpus found three real bugs, all of the worst kind: a wrong answer with no error. `DISTINCT`
+was read as a column name, `ORDER BY 1` sorted by a constant, and type names like `VARCHAR(8)`
+rejected the whole schema. The first two are in the bug diary. That is exactly what borrowing
+somebody else's tests is for: they ask for things the author would not have thought to ask.
 
 **Transactional correctness** — the classic isolation anomalies, measured at two levels because
 they answer different questions.
@@ -275,10 +301,46 @@ a second writer: the two-transaction schedule cannot even be built. A battery th
 engine would report "prevented" for all five, and would be reporting the concurrency model while
 appearing to report the isolation level. That distinction is why the battery has two levels.
 
-**Performance** — compared against SQLite on identical workloads. Expectation: `lastro` loses by
-a wide margin. SQLite has 25 years of optimization. The charts will be published showing the
-loss, together with the analysis of where the time goes. An interesting benchmark is not the one
-that shows who won, it is the one that explains why.
+**Performance** — against SQLite 3.46, on the same workloads and with the **same durability**:
+write-ahead logging with an `fsync` at every commit on both sides, 2 MiB of cache each, and both
+forced to re-parse the text of every statement, because lastro has no prepared statements.
+Measuring against `synchronous = NORMAL` would be comparing a database that survives power loss
+against one that does not.
+
+5,000 rows, 3 runs, median. A shared CI machine — the spread column says how much to trust it.
+
+| Workload | lastro | SQLite | ratio |
+|---|---|---|---|
+| Insert in key order | 17.0 µs/row | 1.9 µs/row | 9.1× slower |
+| Insert in random order | 27.1 µs/row | 2.1 µs/row | 12.6× slower |
+| Lookup by primary key | 3.2 µs/lookup | 5.3 µs/lookup | 0.6× |
+| Range scan over a tenth of the table | 114.0 µs/scan | 42.7 µs/scan | 2.7× slower |
+| Update by primary key | 32.3 µs/update | 2.5 µs/update | 12.9× slower |
+| One row per transaction | 378.1 µs/commit | 272.5 µs/commit | 1.4× slower |
+
+**The lookup line is not a win.** At 5,000 rows the whole table fits in cache on both sides, so what
+is being measured is parsing the statement plus one descent of the tree. lastro's grammar is a
+fraction of SQLite's, so its parser is faster for being smaller, not for being better. Switching
+both sides to prepared statements would flip that line immediately.
+
+**Where the time goes on writes.** Every B+Tree mutation here reads the whole node into vectors,
+edits, and writes it back: O(page) with an allocation per insert, where SQLite edits the page in
+place. On top of that, each insert opens an edit session and logs its diff. Those two decisions are
+what the 9× and the 12× are made of, and both were taken for clarity — the code that rebuilds a
+node is readable, the code that edits it in place is not. It is documented as a cost, not as a
+surprise.
+
+**The scan** pays for a cursor that holds no pin between calls: every row re-pins its frame in the
+buffer pool. That was deliberate (a cursor holding a pin is a cursor that can wedge the pool), and
+2.7× is the price.
+
+**The last line is what validates the measurement.** When every commit costs an `fsync`, the disk
+dominates and the gap between the engines shrinks to 1.4×. If that line showed 10× as well, it
+would be a sign the comparison was measuring something else.
+
+Reproduce: `cargo run --release -p lastro-bench`. The program prints the plans alongside the times,
+because a ratio without a plan explains nothing.
+
 
 ---
 
@@ -286,6 +348,31 @@ that shows who won, it is the one that explains why.
 
 A record of the mistakes that cost real time, because that is the part that actually taught
 something.
+
+### The `ORDER BY` that ordered by nothing
+
+`ORDER BY 1` means the first output column. The planner read the `1` as the number one, bound the
+sort to a constant, and sorting by a constant is not sorting: the rows came back in whatever order
+the scan produced them. Every value correct, the order wrong, and no error anywhere.
+
+It is the most dangerous category of bug there is — the one that produces a plausible answer. No
+test written here caught it, because writing a test for `ORDER BY 1` requires first suspecting it
+could be broken. SQLite's corpus found 43 cases at once.
+
+The fix has a subtlety: the sort sits **below** the projection in the plan, so the ordinal cannot
+become "output column n" — that column does not exist yet. It becomes the expression that column is
+computed from. And an ordinal outside the output is now refused rather than ignored.
+
+### The `DISTINCT` that was a column name
+
+`DISTINCT` was not in the keyword list, so `SELECT DISTINCT cor FROM t` parsed as a column called
+`DISTINCT` aliased to `cor`, and failed with "there is no column called DISTINCT". The error even
+looks honest, and is the opposite: the front end accepted the statement and answered a different
+question. A missing feature should be a refusal in the parser, never a complaint about the schema.
+
+The distinction earns its keep because the sqllogictest runner classifies on exactly that line:
+what the parser refuses is an absence, what it accepts and then gets wrong is this project's bug.
+While `DISTINCT` became a column name it counted as a bug — correctly.
 
 ### The metadata page that went down before the others
 

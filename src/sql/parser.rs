@@ -498,7 +498,6 @@ impl Parser {
             TokenKind::Ident(_) => self.type_by_affinity()?,
             _ => return Err(self.unexpected("a column type")),
         };
-        
 
         let mut constraints = Vec::new();
         loop {
