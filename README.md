@@ -76,6 +76,7 @@ registro de log e as invariantes de cada estrutura estão definidos abaixo.
 | [09 · Roadmap](docs/pt/09-roadmap.md) | Ordem de construção e critério de pronto por camada |
 | [10 · Glossário](docs/pt/10-glossario.md) | Vocabulário de banco de dados, sem enrolação |
 | [ADR](docs/pt/adr.md) | Decisões de arquitetura e o que foi descartado |
+| [Diário de bugs](POSTMORTEM.md) | Os cinco erros que os testes existentes deixaram passar, e o que cada um ensinou |
 
 ---
 

@@ -76,6 +76,7 @@ format and the invariants of every structure are defined below.
 | [09 · Roadmap](docs/en/09-roadmap.md) | Build order and definition of done per layer |
 | [10 · Glossary](docs/en/10-glossary.md) | Database vocabulary, no hand-waving |
 | [ADR](docs/en/adr.md) | Architecture decisions, and what was rejected |
+| [Bug diary](POSTMORTEM.en.md) | The five defects the existing tests let through, and what each one taught |
 
 ---
 
