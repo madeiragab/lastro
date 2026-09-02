@@ -27,7 +27,15 @@ pub struct WalStats {
 pub struct Wal {
     file: File,
     path: PathBuf,
-    /// The next LSN to hand out, which is also the logical length of the log.
+    /// The LSN the file's first byte stands for.
+    ///
+    /// A checkpoint empties the file but must not restart the numbering: pages
+    /// on disk carry the LSNs they were stamped with, and a redo pass compares
+    /// against them. Restarting at zero makes every one of those pages look
+    /// newer than the log and redo skips the lot, silently. So the file offset
+    /// is `lsn - base`, and `base` is kept in the metadata page.
+    base: Lsn,
+    /// The next LSN to hand out. `base` plus the file's length.
     end: Lsn,
     /// Appended but not yet written to the file.
     pending: Vec<u8>,
@@ -46,10 +54,13 @@ impl Wal {
 
     /// Opens the log at `path`, creating it if it does not exist.
     ///
+    /// `base` is the LSN the file's first byte stands for, which the caller
+    /// reads from the metadata page's `last_checkpoint_lsn`.
+    ///
     /// New records append after whatever is already there. Recovery runs before
     /// this in the normal flow, so anything present is a prefix recovery has
     /// already accounted for.
-    pub fn open(path: impl AsRef<Path>) -> Result<Wal> {
+    pub fn open(path: impl AsRef<Path>, base: Lsn) -> Result<Wal> {
         let path = path.as_ref().to_path_buf();
         let mut file = OpenOptions::new()
             .read(true)
@@ -57,10 +68,11 @@ impl Wal {
             .create(true)
             .truncate(false)
             .open(&path)?;
-        let end = file.seek(SeekFrom::End(0))?;
+        let end = base + file.seek(SeekFrom::End(0))?;
         Ok(Wal {
             file,
             path,
+            base,
             end,
             pending: Vec::new(),
             durable: end,
@@ -68,12 +80,17 @@ impl Wal {
         })
     }
 
+    /// The LSN the file's first byte stands for. Belongs in the metadata page.
+    pub fn base_lsn(&self) -> Lsn {
+        self.base
+    }
+
     /// Where the log lives.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// The LSN the next record will be given, which is the log's length.
+    /// The LSN the next record will be given.
     pub fn end_lsn(&self) -> Lsn {
         self.end
     }
@@ -156,11 +173,11 @@ impl Wal {
     /// Reads the whole log into memory. Bounded by how often
     /// [`Wal::checkpoint_truncate`] runs, and the note in
     /// `docs/en/05-wal-recovery.md` explains why that is enough for now.
-    pub fn read_all(path: impl AsRef<Path>) -> Result<(Vec<Record>, u64)> {
+    pub fn read_all(path: impl AsRef<Path>, base: Lsn) -> Result<(Vec<Record>, Lsn)> {
         let mut file = match File::open(path.as_ref()) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((Vec::new(), 0))
+                return Ok((Vec::new(), base))
             }
             Err(error) => return Err(error.into()),
         };
@@ -175,9 +192,9 @@ impl Wal {
                 Some((record, read)) => {
                     // A record whose stored LSN disagrees with where it sits is
                     // not a torn tail, it is a log that has been rearranged.
-                    if record.lsn != offset as Lsn {
+                    if record.lsn != base + offset as Lsn {
                         return Err(crate::Error::MalformedFile(format!(
-                            "record at offset {offset} claims lsn {}",
+                            "record at offset {offset} of a log based at {base} claims lsn {}",
                             record.lsn
                         )));
                     }
@@ -187,20 +204,21 @@ impl Wal {
                 None => break,
             }
         }
-        Ok((records, offset as u64))
+        Ok((records, base + offset as Lsn))
     }
 
     /// Cuts the log back to `len`, discarding a torn tail.
     ///
     /// Called by recovery before it appends anything, so that the compensation
     /// records it writes land at the offsets their own LSNs claim.
-    pub fn truncate_to(&mut self, len: Lsn) -> Result<()> {
+    pub fn truncate_to(&mut self, lsn: Lsn) -> Result<()> {
+        let offset = lsn.saturating_sub(self.base);
         self.pending.clear();
-        self.file.set_len(len)?;
-        self.file.seek(SeekFrom::Start(len))?;
+        self.file.set_len(offset)?;
+        self.file.seek(SeekFrom::Start(offset))?;
         self.file.sync_all()?;
-        self.end = len;
-        self.durable = len;
+        self.end = self.base + offset;
+        self.durable = self.end;
         self.stats.syncs += 1;
         Ok(())
     }
@@ -219,8 +237,10 @@ impl Wal {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         self.file.sync_all()?;
-        self.end = 0;
-        self.durable = 0;
+        // The file restarts; the numbering does not. The caller must record the
+        // new base in the metadata page before anything else happens.
+        self.base = self.end;
+        self.durable = self.end;
         self.stats.syncs += 1;
         Ok(())
     }
@@ -241,7 +261,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.wal");
 
-        let mut wal = Wal::open(&path).unwrap();
+        let mut wal = Wal::open(&path, 0).unwrap();
         let first = wal.append(1, 0, RecordBody::Begin).unwrap();
         let second = wal.append(1, first, edit(7, 9)).unwrap();
         let third = wal.append(1, second, RecordBody::Commit).unwrap();
@@ -251,7 +271,7 @@ mod tests {
         assert!(second > first && third > second);
         assert_eq!(wal.end_lsn(), wal.durable_lsn());
 
-        let (records, intact) = Wal::read_all(&path).unwrap();
+        let (records, intact) = Wal::read_all(&path, 0).unwrap();
         assert_eq!(intact, wal.end_lsn(), "nothing was torn");
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].lsn, first);
@@ -265,19 +285,19 @@ mod tests {
         let path = dir.path().join("t.wal");
 
         let end = {
-            let mut wal = Wal::open(&path).unwrap();
+            let mut wal = Wal::open(&path, 0).unwrap();
             wal.append(1, 0, RecordBody::Begin).unwrap();
             wal.sync().unwrap();
             wal.end_lsn()
         };
 
-        let mut wal = Wal::open(&path).unwrap();
+        let mut wal = Wal::open(&path, 0).unwrap();
         assert_eq!(wal.end_lsn(), end);
         let next = wal.append(2, 0, RecordBody::Begin).unwrap();
         assert_eq!(next, end);
         wal.sync().unwrap();
 
-        let (records, _) = Wal::read_all(&path).unwrap();
+        let (records, _) = Wal::read_all(&path, 0).unwrap();
         assert_eq!(records.len(), 2);
     }
 
@@ -286,7 +306,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.wal");
 
-        let mut wal = Wal::open(&path).unwrap();
+        let mut wal = Wal::open(&path, 0).unwrap();
         wal.append(1, 0, RecordBody::Begin).unwrap();
         let second = wal.append(1, 0, edit(7, 9)).unwrap();
         wal.append(1, second, RecordBody::Commit).unwrap();
@@ -300,7 +320,7 @@ mod tests {
             let bytes = std::fs::read(&path).unwrap();
             std::fs::write(&path, &bytes[..cut as usize]).unwrap();
 
-            let (records, _) = Wal::read_all(&path).unwrap();
+            let (records, _) = Wal::read_all(&path, 0).unwrap();
             assert!(
                 records.len() <= 3,
                 "a truncated log must not gain records at cut {cut}"
@@ -315,7 +335,7 @@ mod tests {
     #[test]
     fn sync_through_only_syncs_when_it_has_to() {
         let dir = tempdir().unwrap();
-        let mut wal = Wal::open(dir.path().join("t.wal")).unwrap();
+        let mut wal = Wal::open(dir.path().join("t.wal"), 0).unwrap();
 
         let lsn = wal.append(1, 0, edit(1, 1)).unwrap();
         assert_eq!(wal.stats().syncs, 0);
@@ -337,19 +357,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("t.wal");
 
-        let mut wal = Wal::open(&path).unwrap();
+        let mut wal = Wal::open(&path, 0).unwrap();
         wal.append(1, 0, edit(1, 1)).unwrap();
         wal.sync().unwrap();
+        let before = wal.end_lsn();
         wal.checkpoint_truncate().unwrap();
 
-        assert_eq!(wal.end_lsn(), 0);
-        let (records, intact) = Wal::read_all(&path).unwrap();
+        // The file is empty but the numbering carries on, so that pages already
+        // stamped with an old LSN do not look newer than the log.
+        assert_eq!(wal.base_lsn(), before);
+        assert_eq!(wal.end_lsn(), before);
+        let (records, intact) = Wal::read_all(&path, wal.base_lsn()).unwrap();
         assert!(records.is_empty());
-        assert_eq!(intact, 0);
+        assert_eq!(intact, before);
 
         // And the log keeps working afterwards.
-        assert_eq!(wal.append(2, 0, RecordBody::Begin).unwrap(), 0);
+        assert_eq!(wal.append(2, 0, RecordBody::Begin).unwrap(), before);
         wal.sync().unwrap();
-        assert_eq!(Wal::read_all(&path).unwrap().0.len(), 1);
+        assert_eq!(Wal::read_all(&path, before).unwrap().0.len(), 1);
     }
 }

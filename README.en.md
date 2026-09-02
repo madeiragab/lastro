@@ -25,6 +25,7 @@ number only goes in after it has been measured.
 | Buffer pool with clock policy | done |
 | B+Tree | done |
 | WAL: record format, the WAL rule, ARIES recovery | done |
+| B+Tree transactional over the log | done |
 | Crash fuzzer | not started |
 | SQL (parser, planner, executor) | not started |
 | MVCC / snapshot isolation | not started |
@@ -188,6 +189,61 @@ that shows who won, it is the one that explains why.
 
 A record of the mistakes that cost real time, because that is the part that actually taught
 something.
+
+### The redo that skipped everything, silently
+
+By far the worst so far, because nothing visibly broke.
+
+A checkpoint empties the log. Since an LSN is the record's own offset in the file, emptying the
+file restarted the numbering at zero. But pages on disk still carry the LSN they were stamped
+with — large numbers, from the log's previous life.
+
+The redo pass compares `page.lsn < record.lsn`, precisely so it can skip what a page already
+reflects. With the numbering restarted, **every** page looked newer than **every** record. Redo
+skipped the entire transaction and reported success.
+
+The symptom was a tree with a key outside its node's range, three layers away from the cause.
+What caught it was `check_tree`, not a behavioural test — again.
+
+The fix uses the field the specification had already reserved: the file offset became
+`lsn - base`, and the base lives in `last_checkpoint_lsn` on the metadata page. The numbering
+never restarts; only the file does.
+
+### The freed page that redo resurrected
+
+When two nodes merge, the leftover page goes back on the freelist. That was done by writing the
+freelist header straight to disk, outside the log.
+
+After a crash, redo reapplied that page's older records — restoring tree content on top of the
+freelist header. The chain of free pages then pointed into live data, and the next allocation
+handed back an invented page number.
+
+Pages are now released only at a checkpoint, when the log is empty and nothing is left to replay
+over them. A transaction that aborts simply does not release: the page leaks space, and that is
+declared as a limitation rather than disguised.
+
+### The page count that travelled backwards
+
+`page_count` was only written at a checkpoint. After a crash the allocator went back to handing
+out page numbers that already held committed data, and the next transaction wrote over them.
+
+Commit now syncs the metadata page **before** writing the commit record. Erring early is the safe
+direction: a crash between the two leaves the transaction to be undone and the metadata merely
+over-counting pages, which leaks space instead of losing data.
+
+### The single range that covered the whole page
+
+Less serious, more instructive. The log stores the smallest difference between a page's before
+and after images. With one contiguous range that is a bad fit for a slotted page: slots grow from
+the front, cells from the back, so almost any change touches both ends and the minimal range
+spans all 4096 bytes.
+
+Measured: 4359 bytes of log for a 200 byte insert — worse than simply writing the whole page.
+Splitting the diff into separate runs, merging those too close together to be worth their own
+record, brought it under 1500.
+
+The lesson: "log only what changed" is cheap only if you know **where** it changed. In a structure
+that grows from both ends, one range is not the answer.
 
 ### The invariant that was wrong twice
 

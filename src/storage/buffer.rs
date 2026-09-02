@@ -20,6 +20,26 @@ use crate::wal::record::{PageEdit, RecordBody};
 use crate::wal::Wal;
 use crate::{Error, Lsn, PageId, Result, TxId};
 
+/// Two differing stretches closer than this are logged as one record rather
+/// than two. A record costs a 36 byte header plus an 8 byte edit header, so
+/// splitting to save fewer bytes than that would lose.
+const EDIT_COALESCE_GAP: usize = 48;
+
+/// The transaction currently open on a pool. Single-writer, so there is at
+/// most one.
+#[derive(Debug)]
+struct ActiveTxn {
+    txid: TxId,
+    /// The last record this transaction wrote, which the next one chains to.
+    last_lsn: Lsn,
+    /// Every edit it has made, newest last, so rollback can walk backwards
+    /// without going back to the log for records that may still be buffered.
+    edits: Vec<(Lsn, Lsn, PageEdit)>,
+    /// Pages it gave up. Held back rather than freed on the spot; see
+    /// [`BufferPool::free_page`].
+    freed: Vec<PageId>,
+}
+
 /// A pin on a cached page. Hand it back to [`BufferPool::unpin`] when done.
 ///
 /// Deliberately neither `Copy` nor `Clone`: every pin must be released exactly
@@ -60,6 +80,13 @@ pub struct BufferPool {
     clock_hand: usize,
     pager: Pager,
     wal: Option<Wal>,
+    txn: Option<ActiveTxn>,
+    /// Pages given up by committed transactions, waiting for a checkpoint to
+    /// actually put them on the freelist. See [`BufferPool::free_page`].
+    pending_frees: Vec<PageId>,
+    /// Pages touched by the operation in flight, with their images from before
+    /// it started. See [`BufferPool::begin_edit`].
+    edit: Option<HashMap<PageId, (usize, Box<Page>)>>,
 }
 
 impl BufferPool {
@@ -76,6 +103,9 @@ impl BufferPool {
             clock_hand: 0,
             pager,
             wal: None,
+            txn: None,
+            pending_frees: Vec::new(),
+            edit: None,
         }
     }
 
@@ -203,6 +233,12 @@ impl BufferPool {
             }
         };
 
+        // Recorded before the initialization, so that the initialization
+        // itself is logged. Without this a page allocated inside a transaction
+        // comes back blank after a crash, and the tree finds a hole where a
+        // node should be.
+        self.record_for_edit(id, frame);
+
         let slot = &mut self.frames[frame];
         slot.page.init(page_type);
         slot.page_id = Some(id);
@@ -218,10 +254,29 @@ impl BufferPool {
     }
 
     /// Reads and writes a pinned page, marking it dirty.
+    ///
+    /// Inside an edit session the first call on a page also snapshots it and
+    /// takes a pin, so that the change can be logged when the session closes
+    /// and so that the page cannot be evicted before then.
     pub fn page_mut(&mut self, pin: &PinnedPage) -> &mut Page {
+        self.record_for_edit(pin.page_id, pin.frame);
         let slot = &mut self.frames[pin.frame];
         slot.dirty = true;
         &mut slot.page
+    }
+
+    /// Snapshots a page the first time an operation touches it, and pins it
+    /// until the session closes. See [`BufferPool::begin_edit`].
+    fn record_for_edit(&mut self, page_id: PageId, frame: usize) {
+        let Some(edit) = self.edit.as_mut() else {
+            return;
+        };
+        if edit.contains_key(&page_id) {
+            return;
+        }
+        let before = Box::new(self.frames[frame].page.clone());
+        edit.insert(page_id, (frame, before));
+        self.frames[frame].pin_count += 1;
     }
 
     /// Releases a pin.
@@ -234,6 +289,15 @@ impl BufferPool {
     /// Releases the last pin on a page and returns it to the freelist.
     pub fn free_page(&mut self, pin: PinnedPage) -> Result<()> {
         let (frame, id) = (pin.frame, pin.page_id);
+
+        // A page being given back has no future worth logging. Drop it from the
+        // edit session, along with the pin the session was holding on it.
+        if let Some(edit) = self.edit.as_mut() {
+            if edit.remove(&id).is_some() {
+                self.frames[frame].pin_count = self.frames[frame].pin_count.saturating_sub(1);
+            }
+        }
+
         if self.frames[frame].pin_count > 1 {
             return Err(Error::PageStillPinned(id));
         }
@@ -245,7 +309,29 @@ impl BufferPool {
         slot.ref_bit = false;
         self.table.remove(&id);
 
-        self.pager.free(id)
+        // Inside a transaction the page is only set aside, not put on the
+        // freelist. Writing the freelist header over it immediately would be an
+        // unlogged write, and redo would later restore the page's old contents
+        // on top of it and break the chain. The page waits for a checkpoint,
+        // when the log is empty and nothing can be replayed over it.
+        match self.txn.as_mut() {
+            Some(txn) => {
+                txn.freed.push(id);
+                Ok(())
+            }
+            None => self.pager.free(id),
+        }
+    }
+
+    /// Puts the pages that committed transactions gave up onto the freelist.
+    ///
+    /// Only safe once the log is empty, which is why the checkpoint calls it
+    /// and nothing else does.
+    pub fn release_pending_frees(&mut self) -> Result<()> {
+        for id in std::mem::take(&mut self.pending_frees) {
+            self.pager.free(id)?;
+        }
+        Ok(())
     }
 
     /// Writes every dirty page and syncs the file.
@@ -310,6 +396,198 @@ impl BufferPool {
         }
 
         self.pager.check_invariants()
+    }
+
+    // -- transactions ------------------------------------------------------
+
+    /// Starts a transaction. Single-writer, so only one may be open at a time.
+    ///
+    /// Without a log attached this is a no-op that hands back a transaction id
+    /// nobody records, which is what keeps every non-logged caller working
+    /// unchanged.
+    pub fn begin_transaction(&mut self) -> Result<TxId> {
+        if self.txn.is_some() {
+            return Err(Error::TransactionAlreadyOpen);
+        }
+        let txid = self.pager.meta().next_txid;
+        self.pager.meta_mut().next_txid += 1;
+
+        let last_lsn = match self.wal.as_mut() {
+            Some(wal) => wal.append(txid, 0, RecordBody::Begin)?,
+            None => 0,
+        };
+        self.txn = Some(ActiveTxn {
+            txid,
+            last_lsn,
+            edits: Vec::new(),
+            freed: Vec::new(),
+        });
+        Ok(txid)
+    }
+
+    /// The open transaction's id, if there is one.
+    pub fn transaction(&self) -> Option<TxId> {
+        self.txn.as_ref().map(|txn| txn.txid)
+    }
+
+    /// Commits the open transaction and makes it durable.
+    ///
+    /// The `fsync` here is the only one on the critical path, and it is
+    /// sequential. The pages the transaction changed may still be dirty in
+    /// memory; the log is enough to bring them back.
+    pub fn commit_transaction(&mut self) -> Result<()> {
+        let Some(txn) = self.txn.take() else {
+            return Err(Error::NoOpenTransaction);
+        };
+
+        // The metadata page goes down before the commit record does. It holds
+        // the page count, and a page count that reverts after a crash hands the
+        // same page numbers out twice — straight over data that was committed.
+        // Erring early is the safe direction: if the crash lands between this
+        // and the commit record, the transaction is undone and the metadata
+        // merely over-counts, which leaks space rather than losing it.
+        self.pager.sync()?;
+
+        if let Some(wal) = self.wal.as_mut() {
+            wal.append(txn.txid, txn.last_lsn, RecordBody::Commit)?;
+            wal.sync()?;
+        }
+        self.pending_frees.extend(txn.freed);
+        Ok(())
+    }
+
+    /// Rolls the open transaction back, newest change first.
+    ///
+    /// Every reversal is logged as a compensation record before it is applied,
+    /// so a crash in the middle of this leaves recovery able to finish the job.
+    pub fn rollback_transaction(&mut self) -> Result<()> {
+        // An operation that failed halfway may have left a session open. Its
+        // changes are about to be reversed anyway, so drop it rather than log
+        // it.
+        self.abort_edit();
+
+        let Some(mut txn) = self.txn.take() else {
+            return Err(Error::NoOpenTransaction);
+        };
+        if self.wal.is_none() {
+            return Ok(());
+        }
+
+        while let Some((lsn, prev_lsn, edit)) = txn.edits.pop() {
+            let compensation = RecordBody::Clr {
+                undo_next_lsn: prev_lsn,
+                edit: PageEdit::new(
+                    edit.page,
+                    edit.offset,
+                    edit.after.clone(),
+                    edit.before.clone(),
+                ),
+            };
+            let wal = self.wal.as_mut().expect("checked above");
+            let clr_lsn = wal.append(txn.txid, lsn, compensation)?;
+
+            let pin = self.fetch(edit.page)?;
+            let start = edit.offset as usize;
+            let page = self.page_mut(&pin);
+            page.as_bytes_mut()[start..start + edit.before.len()].copy_from_slice(&edit.before);
+            page.set_lsn(clr_lsn);
+            self.unpin(pin);
+
+            txn.last_lsn = clr_lsn;
+        }
+
+        let wal = self.wal.as_mut().expect("checked above");
+        wal.append(txn.txid, txn.last_lsn, RecordBody::Abort)?;
+        wal.sync()?;
+
+        // Pages the transaction gave up are simply dropped. They are no longer
+        // referenced by anything and they are not on the freelist either, so
+        // they leak until the file is rebuilt. Space, not correctness; recorded
+        // as a known limitation rather than pretended away.
+        Ok(())
+    }
+
+    // -- edit sessions -----------------------------------------------------
+
+    /// Starts recording the pages an operation is about to change.
+    ///
+    /// While a session is open, the first [`BufferPool::page_mut`] on a page
+    /// snapshots it and takes an extra pin. The pin is what makes this correct:
+    /// a page with changes that are not in the log yet must not be evicted,
+    /// because the WAL rule could not be honoured for changes that have not
+    /// been written down. It is released by [`BufferPool::end_edit`].
+    ///
+    /// The pool therefore needs a frame for every page a single operation
+    /// touches. For a B+Tree that is the descent path plus the pages a split
+    /// creates; too few frames surfaces loudly as [`Error::AllFramesPinned`]
+    /// rather than as a slow leak.
+    ///
+    /// A no-op when there is no log or no open transaction, which is what lets
+    /// every caller run the same code whether or not it is being logged.
+    pub fn begin_edit(&mut self) {
+        if self.wal.is_some() && self.txn.is_some() && self.edit.is_none() {
+            self.edit = Some(HashMap::new());
+        }
+    }
+
+    /// Closes the session, logging the smallest edit that describes each page.
+    ///
+    /// Diffing whole images and logging only what moved is what keeps this
+    /// physiological rather than physical: rewriting a node to change one cell
+    /// costs a record the size of that cell, not the size of a page.
+    pub fn end_edit(&mut self) -> Result<()> {
+        let Some(edit) = self.edit.take() else {
+            return Ok(());
+        };
+        let Some(txn) = self.txn.as_mut() else {
+            return Ok(());
+        };
+
+        // Sorted so that the same operation produces the same log twice, which
+        // matters when a failing crash-fuzzer seed has to be replayed.
+        let mut touched: Vec<(PageId, usize, Box<Page>)> = edit
+            .into_iter()
+            .map(|(page, (frame, before))| (page, frame, before))
+            .collect();
+        touched.sort_by_key(|(page, _, _)| *page);
+
+        for (page_id, frame, before) in touched {
+            let runs = PageEdit::runs(
+                page_id,
+                before.as_bytes(),
+                self.frames[frame].page.as_bytes(),
+                EDIT_COALESCE_GAP,
+            );
+            let mut last_lsn = txn.last_lsn;
+            for diff in runs {
+                let wal = self.wal.as_mut().ok_or(Error::NoLogAttached)?;
+                let lsn = wal.append(txn.txid, last_lsn, RecordBody::Update(diff.clone()))?;
+                txn.edits.push((lsn, last_lsn, diff));
+                last_lsn = lsn;
+            }
+            // Stamped after the diffs are taken, so an edit that happens to span
+            // the header's own LSN field cannot leave a stale value behind.
+            if last_lsn != txn.last_lsn {
+                self.frames[frame].page.set_lsn(last_lsn);
+                txn.last_lsn = last_lsn;
+            }
+            self.frames[frame].pin_count = self.frames[frame].pin_count.saturating_sub(1);
+        }
+        Ok(())
+    }
+
+    /// Abandons a session without logging anything, releasing its pins.
+    ///
+    /// For the error path: an operation that failed halfway has left the pages
+    /// in whatever state it got to, and the transaction it belongs to is going
+    /// to be rolled back.
+    pub fn abort_edit(&mut self) {
+        let Some(edit) = self.edit.take() else {
+            return;
+        };
+        for (_, (frame, _)) in edit {
+            self.frames[frame].pin_count = self.frames[frame].pin_count.saturating_sub(1);
+        }
     }
 
     // -- private -----------------------------------------------------------
