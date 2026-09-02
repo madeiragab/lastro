@@ -1104,3 +1104,156 @@ fn an_index_finds_rows_through_versions() {
     db.query("DELETE FROM t WHERE id <= 50").unwrap();
     assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'c9'").len(), 50);
 }
+
+// -- reclaiming ------------------------------------------------------------
+
+#[test]
+fn a_vacuum_reclaims_what_a_delete_left_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::with_capacity(dir.path().join("vacuum.lastro"), 32).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, texto TEXT)")
+        .unwrap();
+
+    let filler = "y".repeat(300);
+    db.execute("BEGIN").unwrap();
+    for id in 1..=600i64 {
+        db.execute(&format!("INSERT INTO t VALUES ({id}, '{filler}')"))
+            .unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+    db.checkpoint().unwrap();
+    let grown = db.pool_mut().pager().page_count();
+
+    db.query("DELETE FROM t").unwrap();
+    db.checkpoint().unwrap();
+    assert_eq!(
+        db.pool_mut().pager().meta().freelist_count,
+        0,
+        "a delete alone gives nothing back"
+    );
+
+    let removed = db.query("VACUUM t").unwrap();
+    assert_eq!(removed, Outcome::Affected(600));
+    db.checkpoint().unwrap();
+
+    assert_eq!(rows(&mut db, "SELECT id FROM t").len(), 0);
+    let freed = db.pool_mut().pager().meta().freelist_count;
+    assert!(
+        freed > grown / 2,
+        "expected most of the {grown} pages back, got {freed}"
+    );
+    db.pool_mut().check_invariants().unwrap();
+}
+
+#[test]
+fn a_vacuum_leaves_what_is_still_readable() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    // Three updates on one row leave three dead versions behind it.
+    db.query("UPDATE t SET n = 11 WHERE id = 1").unwrap();
+    db.query("UPDATE t SET n = 12 WHERE id = 1").unwrap();
+    db.query("DELETE FROM t WHERE id = 3").unwrap();
+
+    let report = db.query("VACUUM t").unwrap();
+    assert_eq!(report, Outcome::Affected(3), "two superseded and one removed");
+
+    let found = rows(&mut db, "SELECT id, n FROM t");
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0][1], Value::Int(12));
+    assert_eq!(found[1][1], Value::Int(20));
+}
+
+#[test]
+fn a_vacuum_leaves_alone_what_an_open_transaction_might_still_read() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    // Inside a transaction the horizon is that transaction, so a version it
+    // removed itself is not settled and must survive the sweep.
+    db.execute("BEGIN").unwrap();
+    db.query("UPDATE t SET n = 20 WHERE id = 1").unwrap();
+    let report = db.query("VACUUM t").unwrap();
+    assert_eq!(report, Outcome::Affected(0), "nothing has settled yet");
+    assert_eq!(rows(&mut db, "SELECT n FROM t")[0][0], Value::Int(20));
+
+    db.execute("ROLLBACK").unwrap();
+    assert_eq!(rows(&mut db, "SELECT n FROM t")[0][0], Value::Int(10));
+}
+
+#[test]
+fn a_vacuum_clears_the_index_entries_that_point_at_nothing() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cor TEXT)")
+        .unwrap();
+    db.execute("BEGIN").unwrap();
+    for id in 1..=100i64 {
+        db.execute(&format!("INSERT INTO t VALUES ({id}, 'c{}')", id % 4))
+            .unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+    db.query("CREATE INDEX idx_cor ON t (cor)").unwrap();
+
+    // Moving every row to one value leaves the old entries behind.
+    db.query("UPDATE t SET cor = 'novo'").unwrap();
+    assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'c1'").len(), 0);
+    assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'novo'").len(), 100);
+
+    let report = db.query("VACUUM t").unwrap();
+    let Outcome::Affected(removed) = report else {
+        panic!()
+    };
+    assert!(removed >= 200, "a hundred versions and a hundred entries: {removed}");
+
+    // And the answers are the same afterwards.
+    assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'c1'").len(), 0);
+    assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'novo'").len(), 100);
+}
+
+#[test]
+fn vacuum_without_a_table_sweeps_every_one() {
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, n INTEGER);
+         CREATE TABLE b (id INTEGER PRIMARY KEY, n INTEGER);
+         INSERT INTO a VALUES (1, 1), (2, 2);
+         INSERT INTO b VALUES (1, 1), (2, 2);",
+    )
+    .unwrap();
+    db.query("DELETE FROM a").unwrap();
+    db.query("DELETE FROM b").unwrap();
+
+    assert_eq!(db.query("VACUUM").unwrap(), Outcome::Affected(4));
+    assert_eq!(rows(&mut db, "SELECT id FROM a").len(), 0);
+    assert_eq!(rows(&mut db, "SELECT id FROM b").len(), 0);
+}
+
+#[test]
+fn a_vacuum_survives_a_crash_like_any_other_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("swept.lastro");
+
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap();
+        db.execute("BEGIN").unwrap();
+        for id in 1..=200i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({id}, {id})"))
+                .unwrap();
+        }
+        db.execute("COMMIT").unwrap();
+        db.query("DELETE FROM t WHERE id > 100").unwrap();
+        db.query("VACUUM t").unwrap();
+        // No checkpoint: the sweep lives only in the log.
+    }
+
+    let mut db = Database::open(&path).unwrap();
+    assert_eq!(rows(&mut db, "SELECT id FROM t").len(), 100);
+    assert_eq!(db.query("VACUUM t").unwrap(), Outcome::Affected(0));
+}

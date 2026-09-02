@@ -99,6 +99,8 @@ pub enum Keyword {
     Unique,
     /// `UPDATE`
     Update,
+    /// `VACUUM`
+    Vacuum,
     /// `VALUES`
     Values,
     /// `WHERE`
@@ -154,6 +156,7 @@ impl Keyword {
             "TRUE" => True,
             "UNIQUE" => Unique,
             "UPDATE" => Update,
+            "VACUUM" => Vacuum,
             "VALUES" => Values,
             "WHERE" => Where,
             _ => return None,
@@ -208,6 +211,7 @@ impl Keyword {
             True => "TRUE",
             Unique => "UNIQUE",
             Update => "UPDATE",
+            Vacuum => "VACUUM",
             Values => "VALUES",
             Where => "WHERE",
         }
