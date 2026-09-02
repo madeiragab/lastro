@@ -24,14 +24,21 @@ número só entra depois de medido.
 | Pager e freelist | concluído |
 | Buffer pool com política clock | concluído |
 | B+Tree | concluído |
-| WAL + crash recovery | não começado |
+| WAL: formato do registro, regra WAL, recovery ARIES | concluído |
+| Crash fuzzer | não começado |
 | SQL (parser, planner, executor) | não começado |
 | MVCC / snapshot isolation | não começado |
 | Suíte de provas | parcial: modelo e propriedade prontos, crash fuzzer não |
 
 O que já roda: criar e abrir um arquivo `.lastro`, alocar e liberar páginas com reuso pela
-freelist, guardar células de tamanho variável em slotted pages com compactação, ler e escrever
-tudo isso através de um buffer pool de tamanho fixo, e inspecionar o arquivo pelo `lastro-cli`.
+freelist, guardar células de tamanho variável em slotted pages com compactação, um índice B+Tree
+com split e fusão sobre isso, e um write-ahead log com recovery ARIES completo — uma transação
+confirmada sobrevive a uma queda que perdeu a página, e uma não confirmada é desfeita mesmo que
+a página já tenha chegado ao disco.
+
+A regra WAL está no caminho de despejo do buffer pool: nenhuma página suja vai ao disco antes do
+registro que a descreve. É uma linha de código, e é a diferença entre um banco de dados e um
+arquivo que às vezes tem seus dados.
 
 Sem dependência nenhuma na biblioteca: CRC32C, varint e as codificações são escritos aqui.
 
