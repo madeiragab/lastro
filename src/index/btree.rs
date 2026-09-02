@@ -142,7 +142,23 @@ impl BTree {
     // -- writes ------------------------------------------------------------
 
     /// Inserts a key, replacing any value already stored under it.
+    ///
+    /// When the pool has a log and an open transaction, everything the insert
+    /// touches is logged as one group of records before it returns. When it has
+    /// neither, the session is a no-op and the tree behaves exactly as before —
+    /// which is what lets the same code serve both.
     pub fn insert(&mut self, pool: &mut BufferPool, key: &[u8], value: &[u8]) -> Result<()> {
+        pool.begin_edit();
+        let outcome = self.insert_unlogged(pool, key, value);
+        if outcome.is_err() {
+            pool.abort_edit();
+            return outcome;
+        }
+        pool.end_edit()?;
+        outcome
+    }
+
+    fn insert_unlogged(&mut self, pool: &mut BufferPool, key: &[u8], value: &[u8]) -> Result<()> {
         if key.len() > MAX_KEY {
             return Err(Error::CellTooLarge(key.len()));
         }
@@ -194,7 +210,20 @@ impl BTree {
     }
 
     /// Removes a key. Returns whether it was there.
+    ///
+    /// Logged as one group, the same way [`BTree::insert`] is.
     pub fn delete(&mut self, pool: &mut BufferPool, key: &[u8]) -> Result<bool> {
+        pool.begin_edit();
+        let outcome = self.delete_unlogged(pool, key);
+        if outcome.is_err() {
+            pool.abort_edit();
+            return outcome;
+        }
+        pool.end_edit()?;
+        outcome
+    }
+
+    fn delete_unlogged(&mut self, pool: &mut BufferPool, key: &[u8]) -> Result<bool> {
         let mut path = Vec::new();
         let leaf_pin = self.descend(pool, key, &mut path)?;
 
