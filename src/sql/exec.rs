@@ -430,24 +430,7 @@ pub fn build(plan: &Plan, pool: &mut BufferPool) -> Result<Op> {
             lower,
             upper,
         } => {
-            let low = lower.map(|bound| {
-                let value = if bound.inclusive {
-                    bound.value
-                } else {
-                    bound.value.saturating_add(1)
-                };
-                encode_i64(value).to_vec()
-            });
-            // The cursor's upper edge is exclusive, so an inclusive bound is
-            // one past the value it names.
-            let high = upper.map(|bound: Bound| {
-                let value = if bound.inclusive {
-                    bound.value.saturating_add(1)
-                } else {
-                    bound.value
-                };
-                encode_i64(value).to_vec()
-            });
+            let (low, high) = encode_bounds(*lower, *upper);
             Op::Scan {
                 types: column_types(table),
                 cursor: BTree::open(table.root).cursor_range(
@@ -503,6 +486,129 @@ fn column_types(table: &TableSchema) -> Vec<ValueType> {
 }
 
 // -- writing ---------------------------------------------------------------
+
+/// The rows a write is about to touch, gathered before any of them change.
+///
+/// Collected first on purpose. A cursor holds no pin between calls, which is
+/// what keeps it cheap, and the price of that is it must not walk a tree that
+/// is being rewritten underneath it. Reading the whole match set first costs
+/// memory proportional to what the statement touches and removes the hazard
+/// entirely.
+fn gather(
+    pool: &mut BufferPool,
+    table: &TableSchema,
+    filter: Option<&PlanExpr>,
+    lower: Option<Bound>,
+    upper: Option<Bound>,
+) -> Result<Vec<(Vec<u8>, Row)>> {
+    let types = column_types(table);
+    let tree = BTree::open(table.root);
+    let (low, high) = encode_bounds(lower, upper);
+    let mut cursor = tree.cursor_range(pool, low.as_deref(), high.as_deref())?;
+
+    let mut matched = Vec::new();
+    while let Some((key, encoded)) = cursor.next(pool)? {
+        let row = decode_tuple(&encoded, &types)
+            .ok_or_else(|| Error::MalformedFile("a row that does not decode".into()))?;
+        let admitted = match filter {
+            Some(predicate) => truth(&eval(predicate, &row)?) == Some(true),
+            None => true,
+        };
+        if admitted {
+            matched.push((key, row));
+        }
+    }
+    Ok(matched)
+}
+
+fn encode_bounds(lower: Option<Bound>, upper: Option<Bound>) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let low = lower.map(|bound| {
+        let value = if bound.inclusive {
+            bound.value
+        } else {
+            bound.value.saturating_add(1)
+        };
+        encode_i64(value).to_vec()
+    });
+    // The upper edge of a cursor is exclusive, so an inclusive bound is one
+    // past the value it names.
+    let high = upper.map(|bound| {
+        let value = if bound.inclusive {
+            bound.value.saturating_add(1)
+        } else {
+            bound.value
+        };
+        encode_i64(value).to_vec()
+    });
+    (low, high)
+}
+
+/// Removes every row the filter admits, returning how many went.
+pub fn delete(
+    pool: &mut BufferPool,
+    table: &TableSchema,
+    filter: Option<&PlanExpr>,
+    lower: Option<Bound>,
+    upper: Option<Bound>,
+) -> Result<usize> {
+    let matched = gather(pool, table, filter, lower, upper)?;
+    let mut tree = BTree::open(table.root);
+    for (key, _) in &matched {
+        tree.delete(pool, key)?;
+    }
+    Ok(matched.len())
+}
+
+/// Applies the assignments to every row the filter admits.
+///
+/// A change to the primary key moves the row, because the primary key is the
+/// key of the table own tree. That is a removal and a fresh write rather than
+/// an edit in place, and the order matters: writing first and removing after
+/// would delete the row that had just been written.
+pub fn update(
+    pool: &mut BufferPool,
+    table: &TableSchema,
+    assignments: &[(usize, PlanExpr)],
+    filter: Option<&PlanExpr>,
+    lower: Option<Bound>,
+    upper: Option<Bound>,
+) -> Result<usize> {
+    let matched = gather(pool, table, filter, lower, upper)?;
+    let rowid_column = table.rowid_column();
+    let mut tree = BTree::open(table.root);
+
+    for (key, row) in &matched {
+        let mut updated = row.clone();
+        for (index, value) in assignments {
+            let column = table.column(*index);
+            let computed = eval(value, row)?;
+            updated[*index] = coerce(&computed, column.data_type, &column.name)?;
+        }
+        for (index, column) in table.columns.iter().enumerate() {
+            if column.not_null && matches!(updated[index], Value::Null) {
+                return Err(Error::NotNull(column.name.clone()));
+            }
+        }
+
+        let new_key = match rowid_column {
+            Some(index) => match updated[index] {
+                Value::Int(number) => encode_i64(number).to_vec(),
+                // Anything else was already refused by the coercion above,
+                // unless it was null, which the check above catches.
+                _ => return Err(Error::NotNull(table.column(index).name.clone())),
+            },
+            None => key.clone(),
+        };
+
+        let mut encoded = Vec::new();
+        encode_tuple(&updated, &mut encoded);
+        if new_key != *key {
+            tree.delete(pool, key)?;
+        }
+        tree.insert(pool, &new_key, &encoded)?;
+    }
+    Ok(matched.len())
+}
 
 /// Writes the rows of an `INSERT`, returning how many landed.
 pub fn insert(

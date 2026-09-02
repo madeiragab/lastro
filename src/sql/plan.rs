@@ -142,6 +142,30 @@ pub enum Plan {
         /// Where each supplied value goes in the table's column order.
         targets: Vec<usize>,
     },
+    /// Changes rows in place.
+    Update {
+        /// The table being changed.
+        table: TableSchema,
+        /// Which column to set, and to what.
+        assignments: Vec<(usize, PlanExpr)>,
+        /// Which rows to change. Absent means every one.
+        filter: Option<PlanExpr>,
+        /// The lower edge of the row id range to walk.
+        lower: Option<Bound>,
+        /// The upper edge of the row id range to walk.
+        upper: Option<Bound>,
+    },
+    /// Removes rows.
+    Delete {
+        /// The table being emptied of them.
+        table: TableSchema,
+        /// Which rows to remove. Absent means every one.
+        filter: Option<PlanExpr>,
+        /// The lower edge of the row id range to walk.
+        lower: Option<Bound>,
+        /// The upper edge of the row id range to walk.
+        upper: Option<Bound>,
+    },
     /// Adds a table to the catalog.
     CreateTable {
         /// The schema to record. Its root page is filled in when it runs.
@@ -178,12 +202,11 @@ pub fn plan(pool: &mut BufferPool, catalog: &Catalog, statement: &ast::Statement
         ast::Statement::Rollback => Ok(Plan::Rollback),
         ast::Statement::Select(select) => plan_select(pool, catalog, select),
         ast::Statement::Insert(insert) => plan_insert(pool, catalog, insert),
+        ast::Statement::Update(update) => plan_update(pool, catalog, update),
+        ast::Statement::Delete(delete) => plan_delete(pool, catalog, delete),
         ast::Statement::CreateTable(create) => plan_create_table(create),
         ast::Statement::Explain(_) => Err(Error::Unsupported(
             "EXPLAIN cannot wrap another EXPLAIN".into(),
-        )),
-        ast::Statement::Update(_) | ast::Statement::Delete(_) => Err(Error::Unsupported(
-            "UPDATE and DELETE are not implemented yet".into(),
         )),
         ast::Statement::CreateIndex(_) => Err(Error::Unsupported(
             "secondary indexes are not implemented yet".into(),
@@ -276,6 +299,60 @@ fn plan_select(pool: &mut BufferPool, catalog: &Catalog, select: &ast::Select) -
         };
     }
     Ok(plan)
+}
+
+fn plan_update(pool: &mut BufferPool, catalog: &Catalog, update: &ast::Update) -> Result<Plan> {
+    let table = catalog.require(pool, &update.table)?;
+    let scope = Scope::single(&table, None);
+
+    let assignments = update
+        .assignments
+        .iter()
+        .map(|(column, value)| {
+            let index = table
+                .column_index(column)
+                .ok_or_else(|| Error::UnknownColumn(column.clone()))?;
+            Ok((index, bind_expr(&scope, value)?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let (lower, upper, filter) = narrow(&scope, &table, update.filter.as_ref())?;
+    Ok(Plan::Update {
+        table,
+        assignments,
+        filter,
+        lower,
+        upper,
+    })
+}
+
+fn plan_delete(pool: &mut BufferPool, catalog: &Catalog, delete: &ast::Delete) -> Result<Plan> {
+    let table = catalog.require(pool, &delete.table)?;
+    let scope = Scope::single(&table, None);
+    let (lower, upper, filter) = narrow(&scope, &table, delete.filter.as_ref())?;
+    Ok(Plan::Delete {
+        table,
+        filter,
+        lower,
+        upper,
+    })
+}
+
+/// Binds a `WHERE` clause and pulls row id bounds out of it.
+///
+/// Rule 1 again, shared by everything that walks a table: a predicate that pins
+/// the row id down turns the walk into a descent, and what it cannot express
+/// stays behind as a filter.
+fn narrow(
+    scope: &Scope,
+    table: &TableSchema,
+    filter: Option<&ast::Expr>,
+) -> Result<(Option<Bound>, Option<Bound>, Option<PlanExpr>)> {
+    let bound = filter.map(|expr| bind_expr(scope, expr)).transpose()?;
+    Ok(match (&bound, table.rowid_column()) {
+        (Some(predicate), Some(rowid)) => split_rowid_bounds(predicate, rowid),
+        _ => (None, None, bound),
+    })
 }
 
 fn plan_insert(pool: &mut BufferPool, catalog: &Catalog, insert: &ast::Insert) -> Result<Plan> {
@@ -725,6 +802,31 @@ impl Plan {
             Plan::Insert { table, rows, .. } => {
                 let _ = writeln!(out, "{pad}Insert {} ({} rows)", table.name, rows.len());
             }
+            Plan::Update {
+                table,
+                assignments,
+                filter,
+                lower,
+                upper,
+            } => {
+                let columns: Vec<String> = assignments
+                    .iter()
+                    .map(|(index, value)| {
+                        format!("{} = {}", table.column(*index).name, describe(value))
+                    })
+                    .collect();
+                let _ = writeln!(out, "{pad}Update {} SET {}", table.name, columns.join(", "));
+                write_walk(out, depth + 1, table, *lower, *upper, filter);
+            }
+            Plan::Delete {
+                table,
+                filter,
+                lower,
+                upper,
+            } => {
+                let _ = writeln!(out, "{pad}Delete {}", table.name);
+                write_walk(out, depth + 1, table, *lower, *upper, filter);
+            }
             Plan::CreateTable { schema, .. } => {
                 let _ = writeln!(out, "{pad}CreateTable {}", schema.name);
             }
@@ -738,6 +840,34 @@ impl Plan {
                 let _ = writeln!(out, "{pad}Rollback");
             }
         }
+    }
+}
+
+/// Renders the scan a write walks over, so `EXPLAIN` shows the same shape for
+/// a change as it does for a query.
+fn write_walk(
+    out: &mut String,
+    depth: usize,
+    table: &TableSchema,
+    lower: Option<Bound>,
+    upper: Option<Bound>,
+    filter: &Option<PlanExpr>,
+) {
+    let pad = "  ".repeat(depth);
+    if let Some(predicate) = filter {
+        let _ = writeln!(out, "{pad}Filter {}", describe(predicate));
+    }
+    let inner = if filter.is_some() { depth + 1 } else { depth };
+    let pad = "  ".repeat(inner);
+    if lower.is_some() || upper.is_some() {
+        let _ = writeln!(
+            out,
+            "{pad}RowIdScan {} ({})",
+            table.name,
+            describe_range(lower, upper)
+        );
+    } else {
+        let _ = writeln!(out, "{pad}SeqScan {}", table.name);
     }
 }
 
