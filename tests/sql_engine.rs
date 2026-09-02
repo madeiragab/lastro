@@ -510,7 +510,7 @@ fn changes_survive_a_crash_and_a_reopen() {
 }
 
 #[test]
-fn emptying_a_large_table_gives_its_pages_back() {
+fn deleting_keeps_the_pages_until_a_vacuum_that_does_not_exist_yet() {
     let dir = tempfile::tempdir().unwrap();
     let mut db = Database::with_capacity(dir.path().join("empty.lastro"), 32).unwrap();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, texto TEXT)")
@@ -529,12 +529,17 @@ fn emptying_a_large_table_gives_its_pages_back() {
     db.query("DELETE FROM t").unwrap();
     db.checkpoint().unwrap();
 
+    // Nothing is readable any more, and nothing has been given back either.
+    // A removed version keeps its bytes so that a reader who started before the
+    // removal still finds it; reclaiming them is what a vacuum is for, and this
+    // build has none. Recorded as a limitation rather than hidden.
     assert_eq!(rows(&mut db, "SELECT id FROM t").len(), 0);
-    let freed = db.pool_mut().pager().meta().freelist_count;
-    assert!(
-        freed > grown / 2,
-        "expected most of the {grown} pages back, got {freed}"
+    assert_eq!(
+        db.pool_mut().pager().meta().freelist_count,
+        0,
+        "a delete does not free pages under versioning"
     );
+    assert!(db.pool_mut().pager().page_count() >= grown);
     db.pool_mut().check_invariants().unwrap();
 }
 
@@ -954,4 +959,148 @@ fn a_limit_over_a_spilled_sort_stops_early() {
     assert_eq!(found.len(), 5);
     assert_eq!(found[0][0], Value::Int(399));
     assert_eq!(found[4][0], Value::Int(395));
+}
+
+// -- versions --------------------------------------------------------------
+
+#[test]
+fn a_transaction_sees_its_own_work_before_committing() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    assert_eq!(rows(&mut db, "SELECT n FROM t")[0][0], Value::Int(10));
+
+    db.execute("UPDATE t SET n = 20 WHERE id = 1").unwrap();
+    assert_eq!(rows(&mut db, "SELECT n FROM t")[0][0], Value::Int(20));
+
+    db.execute("DELETE FROM t WHERE id = 1").unwrap();
+    assert_eq!(rows(&mut db, "SELECT n FROM t").len(), 0);
+    db.execute("COMMIT").unwrap();
+    assert_eq!(rows(&mut db, "SELECT n FROM t").len(), 0);
+}
+
+#[test]
+fn a_snapshot_is_held_for_the_whole_transaction() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    // Repeatable read: the snapshot is taken at BEGIN, so a row this
+    // transaction did not touch reads the same however often it is asked for.
+    db.execute("BEGIN").unwrap();
+    let first = rows(&mut db, "SELECT n FROM t");
+    db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    let second = rows(&mut db, "SELECT n FROM t WHERE id = 1");
+    assert_eq!(first[0][0], second[0][0]);
+    db.execute("COMMIT").unwrap();
+}
+
+#[test]
+fn an_update_leaves_the_old_version_behind() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+
+    // Three updates make four versions of one row. A scan must still find
+    // exactly one, because at most one version is ever visible.
+    db.execute("UPDATE t SET n = 20 WHERE id = 1").unwrap();
+    db.execute("UPDATE t SET n = 30 WHERE id = 1").unwrap();
+    db.execute("UPDATE t SET n = 40 WHERE id = 1").unwrap();
+
+    let found = rows(&mut db, "SELECT n FROM t");
+    assert_eq!(found.len(), 1, "one row, however many versions of it");
+    assert_eq!(found[0][0], Value::Int(40));
+    assert_eq!(rows(&mut db, "SELECT n FROM t WHERE id = 1").len(), 1);
+}
+
+#[test]
+fn a_rolled_back_change_leaves_no_version_behind() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+
+    db.execute("BEGIN").unwrap();
+    db.execute("UPDATE t SET n = 99").unwrap();
+    db.execute("DELETE FROM t WHERE id = 2").unwrap();
+    db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    db.execute("ROLLBACK").unwrap();
+
+    let found = rows(&mut db, "SELECT id, n FROM t");
+    assert_eq!(found.len(), 2);
+    assert_eq!(found[0][1], Value::Int(10));
+    assert_eq!(found[1][1], Value::Int(20));
+}
+
+#[test]
+fn versions_survive_a_crash_and_only_the_committed_one_comes_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("versions.lastro");
+
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        db.execute("UPDATE t SET n = 20 WHERE id = 1").unwrap();
+
+        // Left open, so the log has it but nobody was told it committed.
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE t SET n = 30 WHERE id = 1").unwrap();
+    }
+
+    let mut db = Database::open(&path).unwrap();
+    let found = rows(&mut db, "SELECT n FROM t");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0][0], Value::Int(20), "the last committed version");
+}
+
+#[test]
+fn a_unique_index_looks_at_what_is_visible_not_at_what_is_stored() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cpf TEXT UNIQUE)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '111')").unwrap();
+
+    // The old version still holds '111' and its index entry is still there.
+    // Neither should stop the value being used again.
+    db.execute("UPDATE t SET cpf = '222' WHERE id = 1").unwrap();
+    db.query("INSERT INTO t VALUES (2, '111')").unwrap();
+    assert_eq!(rows(&mut db, "SELECT id FROM t").len(), 2);
+
+    // And a value that is genuinely still in use is still refused.
+    assert!(db.query("INSERT INTO t VALUES (3, '222')").is_err());
+}
+
+#[test]
+fn an_index_finds_rows_through_versions() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cor TEXT)")
+        .unwrap();
+    db.execute("BEGIN").unwrap();
+    for id in 1..=200i64 {
+        db.execute(&format!("INSERT INTO t VALUES ({id}, 'c{}')", id % 5))
+            .unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+    db.query("CREATE INDEX idx_cor ON t (cor)").unwrap();
+
+    assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'c3'").len(), 40);
+
+    // Moving rows out of a value leaves stale entries behind. The fetch checks
+    // visibility and the filter is kept above, so the answer stays right.
+    db.query("UPDATE t SET cor = 'c9' WHERE id <= 100").unwrap();
+    assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'c3'").len(), 20);
+    assert_eq!(
+        rows(&mut db, "SELECT id FROM t WHERE cor = 'c9'").len(),
+        100
+    );
+
+    db.query("DELETE FROM t WHERE id <= 50").unwrap();
+    assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'c9'").len(), 50);
 }

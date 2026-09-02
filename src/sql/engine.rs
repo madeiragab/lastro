@@ -7,7 +7,9 @@ use std::path::Path;
 
 use crate::index::BTree;
 use crate::sql::catalog::{Catalog, IndexSchema};
+use crate::sql::exec::Writer;
 use crate::sql::exec::{self, Row};
+use crate::sql::mvcc::Snapshot;
 use crate::sql::plan::{plan, Plan};
 use crate::sql::{ast, parse_many};
 use crate::storage::{BufferPool, Pager};
@@ -42,6 +44,10 @@ pub struct Database {
     explicit: bool,
     /// How many rows a sort holds before it writes a run out.
     sort_budget: usize,
+    /// The snapshot an open transaction reads through. Taken once at `BEGIN`
+    /// and held, which is what makes a repeated query inside one transaction
+    /// return the same rows.
+    held: Option<Snapshot>,
     report: RecoveryReport,
 }
 
@@ -80,6 +86,7 @@ impl Database {
             catalog,
             explicit: false,
             sort_budget: exec::DEFAULT_SORT_ROWS,
+            held: None,
             report,
         })
     }
@@ -133,16 +140,19 @@ impl Database {
             ast::Statement::Begin => {
                 self.pool.begin_transaction()?;
                 self.explicit = true;
+                self.held = Some(self.take_snapshot());
                 Ok(Outcome::Ack)
             }
             ast::Statement::Commit => {
                 self.pool.commit_transaction()?;
                 self.explicit = false;
+                self.held = None;
                 Ok(Outcome::Ack)
             }
             ast::Statement::Rollback => {
                 self.pool.rollback_transaction()?;
                 self.explicit = false;
+                self.held = None;
                 Ok(Outcome::Ack)
             }
             ast::Statement::Explain(inner) => {
@@ -154,7 +164,8 @@ impl Database {
             ast::Statement::Select(_) => {
                 let plan = plan(&mut self.pool, &self.catalog, statement)?;
                 let columns = plan.output_names();
-                let mut op = exec::build_with(&plan, &mut self.pool, self.sort_budget)?;
+                let snapshot = self.snapshot();
+                let mut op = exec::build_with(&plan, &mut self.pool, snapshot, self.sort_budget)?;
                 let mut rows = Vec::new();
                 while let Some(row) = op.next(&mut self.pool)? {
                     rows.push(row);
@@ -182,7 +193,31 @@ impl Database {
         }
     }
 
+    /// The snapshot this statement reads through.
+    ///
+    /// Inside a transaction it is the one taken at `BEGIN`, so the same query
+    /// twice gives the same answer. Outside one it is fresh, so each statement
+    /// sees whatever has committed by the time it runs.
+    fn snapshot(&self) -> Snapshot {
+        self.held.unwrap_or_else(|| self.take_snapshot())
+    }
+
+    fn take_snapshot(&self) -> Snapshot {
+        let open = self.pool.transaction();
+        Snapshot {
+            own: open,
+            xmax: self.pool.pager().meta().next_txid,
+            active: open,
+        }
+    }
+
     fn run_write(&mut self, statement: &ast::Statement) -> Result<Outcome> {
+        // A write always reads through its own transaction, so it sees what it
+        // has already done in this statement and in earlier ones.
+        let writer = Writer {
+            snapshot: self.take_snapshot(),
+            txid: self.pool.transaction().ok_or(Error::NoOpenTransaction)?,
+        };
         let plan = plan(&mut self.pool, &self.catalog, statement)?;
         match plan {
             Plan::CreateTable {
@@ -227,7 +262,7 @@ impl Database {
                 let mut index = index;
                 index.root = tree.root();
 
-                let built = exec::build_index(&mut self.pool, &table, &index)?;
+                let built = exec::build_index(&mut self.pool, &table, &index, writer.snapshot)?;
                 table.indexes.push(index);
 
                 let mut catalog = self.catalog;
@@ -240,7 +275,7 @@ impl Database {
                 rows,
                 targets,
             } => {
-                let written = exec::insert(&mut self.pool, &table, &targets, &rows)?;
+                let written = exec::insert(&mut self.pool, &table, &targets, &rows, writer)?;
                 Ok(Outcome::Affected(written))
             }
             Plan::Update {
@@ -257,6 +292,7 @@ impl Database {
                     filter.as_ref(),
                     lower,
                     upper,
+                    writer,
                 )?;
                 Ok(Outcome::Affected(changed))
             }
@@ -266,7 +302,14 @@ impl Database {
                 lower,
                 upper,
             } => {
-                let removed = exec::delete(&mut self.pool, &table, filter.as_ref(), lower, upper)?;
+                let removed = exec::delete(
+                    &mut self.pool,
+                    &table,
+                    filter.as_ref(),
+                    lower,
+                    upper,
+                    writer,
+                )?;
                 Ok(Outcome::Affected(removed))
             }
             other => Err(Error::Unsupported(format!(
