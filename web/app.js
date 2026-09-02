@@ -48,8 +48,13 @@ async function run(statements) {
   const lines = [];
   const collect = (line) => lines.push(line);
 
+  // The script goes in through stdin rather than as an argument. The shim
+  // sizes the argument buffer with `arg.length`, which counts UTF-16 code
+  // units, and then fills it with UTF-8 bytes: one accented character in a
+  // comment writes past the end and corrupts whatever the guest had there.
+  // A file descriptor carries bytes and has no such disagreement.
   const fds = [
-    new OpenFile(new File([])), // stdin, never read
+    new OpenFile(new File(new TextEncoder().encode(statements))),
     ConsoleStdout.lineBuffered(collect),
     ConsoleStdout.lineBuffered(collect),
     // The same Map every time. That is the persistence.
@@ -58,7 +63,7 @@ async function run(statements) {
     new PreopenDirectory("/tmp", new Map()),
   ];
 
-  const wasi = new WASI(["lastro-cli", "sql", DB_PATH, statements], [], fds);
+  const wasi = new WASI(["lastro-cli", "sql", DB_PATH, "-"], [], fds);
   const instance = await WebAssembly.instantiate(engine, {
     wasi_snapshot_preview1: wasi.wasiImport,
   });
