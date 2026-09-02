@@ -7,6 +7,8 @@
 
 use std::process::ExitCode;
 
+use lastro::sql::{Database, Outcome};
+use lastro::storage::page::encoding::Value;
 use lastro::storage::page::{Page, PageType};
 use lastro::storage::Pager;
 use lastro::{PageId, Result, PAGE_SIZE};
@@ -15,10 +17,11 @@ const USAGE: &str = "\
 lastro-cli — inspect a lastro database
 
 usage:
-    lastro-cli create <file>          create an empty database
-    lastro-cli info <file>            print the metadata page
-    lastro-cli pages <file>           summarize every page
-    lastro-cli page <file> <number>   dump one page header
+    lastro-cli sql <file> <statements>   run SQL and print the result
+    lastro-cli create <file>             create an empty database
+    lastro-cli info <file>               print the metadata page
+    lastro-cli pages <file>              summarize every page
+    lastro-cli page <file> <number>      dump one page header
 ";
 
 fn main() -> ExitCode {
@@ -26,6 +29,7 @@ fn main() -> ExitCode {
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let outcome = match refs.as_slice() {
+        ["sql", path, statements] => sql(path, statements),
         ["create", path] => create(path),
         ["info", path] => info(path),
         ["pages", path] => pages(path),
@@ -48,6 +52,73 @@ fn main() -> ExitCode {
             eprintln!("lastro: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Runs statements and prints whatever they produce.
+fn sql(path: &str, statements: &str) -> Result<()> {
+    let mut db = Database::open(path)?;
+    for outcome in db.execute(statements)? {
+        match outcome {
+            Outcome::Rows { columns, rows } => print_rows(&columns, &rows),
+            Outcome::Affected(count) => println!("{count} row(s)"),
+            Outcome::Plan(plan) => print!("{plan}"),
+            Outcome::Ack => println!("ok"),
+        }
+    }
+    db.checkpoint()
+}
+
+/// Prints a result as a table, sized to its widest cell.
+fn print_rows(columns: &[String], rows: &[Vec<Value>]) {
+    let rendered: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| row.iter().map(render).collect())
+        .collect();
+
+    let mut widths: Vec<usize> = columns.iter().map(|name| name.chars().count()).collect();
+    for row in &rendered {
+        for (index, cell) in row.iter().enumerate() {
+            if index < widths.len() {
+                widths[index] = widths[index].max(cell.chars().count());
+            }
+        }
+    }
+
+    let header: Vec<String> = columns
+        .iter()
+        .zip(&widths)
+        .map(|(name, width)| format!("{name:<width$}"))
+        .collect();
+    println!("{}", header.join("  "));
+    println!(
+        "{}",
+        widths
+            .iter()
+            .map(|w| "-".repeat(*w))
+            .collect::<Vec<_>>()
+            .join("  ")
+    );
+
+    for row in &rendered {
+        let cells: Vec<String> = row
+            .iter()
+            .zip(&widths)
+            .map(|(cell, width)| format!("{cell:<width$}"))
+            .collect();
+        println!("{}", cells.join("  "));
+    }
+    println!("({} rows)", rows.len());
+}
+
+fn render(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Int(number) => number.to_string(),
+        Value::Real(number) => format!("{number}"),
+        Value::Text(text) => text.clone(),
+        Value::Blob(bytes) => format!("<{} bytes>", bytes.len()),
     }
 }
 
