@@ -1,0 +1,25 @@
+[package]
+name = "lastro"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.74"
+description = "An embedded relational database written from scratch: pager, B+Tree, WAL with crash recovery, SQL parser and MVCC."
+license = "MIT"
+repository = "https://github.com/madeiragab/lastro"
+readme = "README.md"
+keywords = ["database", "storage-engine", "btree", "wal"]
+categories = ["database-implementations"]
+
+# The library itself has no dependencies. Everything below the SQL layer is
+# written from scratch, including CRC32C and the varint codec.
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[profile.release]
+debug = true          # keeps symbols for flamegraph profiling
+
+[profile.test]
+opt-level = 1         # property tests are slow without it
