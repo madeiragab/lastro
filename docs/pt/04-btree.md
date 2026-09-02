@@ -134,21 +134,25 @@ Remover é sempre mais difícil que inserir.
 
 ```
 remover(chave):
-    localiza a folha
-    marca o slot como morto, atualiza `fragmented`
-    se ocupação da folha >= 40%: termina
-
-    se um irmão pode emprestar sem cair abaixo de 40%:
-        redistribui, atualiza o separador no pai
-    senão:
-        funde com o irmão, remove o separador do pai
-        se o pai cair abaixo de 40%: repete no nível acima
-        se a raiz ficar com um único filho: a árvore perde um nível
+    localiza a folha, remove a entrada
+    sobe pelo caminho da descida, e em cada nível:
+        se o nó e o irmão da esquerda cabem juntos: funde
+        senão, se o nó e o irmão da direita cabem juntos: funde
+        senão: para, porque nada acima mudou
+    se a raiz ficar com um único filho: a árvore perde um nível
 ```
 
-O limiar de 40% em vez de 50% cria histerese. Com 50% exato, uma sequência alternada de inserção
-e remoção na fronteira faz a árvore rachar e fundir a cada operação, queimando E/S sem mudar
-nada. A faixa morta entre 40% e 50% mata essa oscilação.
+**Os dois vizinhos precisam ser tentados.** Olhar só para a esquerda deixa parado um nó que
+poderia ter fundido para a direita. Nada quebra de forma visível quando isso acontece — a árvore
+continua correta, só vai ficando esparsa — que é exatamente o motivo de existir uma verificação
+de invariante em vez de confiar em teste de comportamento.
+
+**Não há redistribuição.** A especificação pedia empréstimo de um irmão quando a fusão não
+coubesse, para segurar o piso de ocupação. Na prática a redistribuição tem um problema próprio:
+ao equilibrar os filhos *k-1* e *k*, ela pode encolher *k-1* o bastante para que *k-2* e *k-1*
+passem a caber juntos, deixando um par fundível para trás. Consertar isso cascateia sem ponto de
+parada natural. Fusão sozinha é simples, é verificável, e o que se abre mão em troca está medido
+na seção seguinte.
 
 ### Plano de contingência
 
@@ -189,11 +193,30 @@ Verificadas por um `check_tree()` chamado no fim de cada teste:
 1. Toda folha está na mesma profundidade. A árvore é perfeitamente balanceada em altura.
 2. Chaves dentro de cada página estão em ordem estritamente crescente.
 3. Todas as chaves de um filho respeitam a faixa definida pelos separadores do pai.
-4. Todo nó exceto a raiz tem ocupação de pelo menos 40%.
+4. Nenhum nó fora da raiz está vazio.
 5. Seguir os ponteiros de irmão da folha mais à esquerda visita todas as chaves, uma vez cada, em
    ordem crescente.
 6. Nenhuma página é alcançável por dois caminhos distintos a partir da raiz.
 7. A contagem de chaves alcançáveis pela árvore é igual à contagem obtida pelo range scan.
+
+### O que aconteceu com "pelo menos 40% cheio"
+
+A especificação afirmava um piso de ocupação por nó. **Duas formulações foram
+tentadas na implementação e nenhuma sobreviveu aos testes de propriedade:**
+
+- *"todo nó tem pelo menos 40% de ocupação"* cai porque uma única célula pode
+  ocupar um terço da página. Uma divisão equilibrada pode deixar as duas metades
+  abaixo do piso sem que exista nada de errado.
+- *"nenhum par de irmãos adjacentes cabe junto em uma página"* cai na
+  **inserção**, não na remoção. Quando um nó cheio racha ao meio, cada metade
+  fica com meia página, e uma delas pode passar a caber junto com o vizinho
+  intocado ao lado — vizinho ao qual ela nunca precisou caber antes. O caso
+  mínimo que o proptest encontrou não tem nenhuma remoção.
+
+Então o fator de preenchimento **não é afirmado aqui, é medido**, por
+`BTree::stats`, e os testes afirmam sobre a medida. Um limite que só vale para
+registros de tamanho fixo não é um limite, e um número conferido a cada execução
+vale mais que uma garantia que silenciosamente não se aplica.
 
 A invariante 5 é a mais valiosa das sete. Ela cruza duas estruturas independentes — a hierarquia
 e a lista ligada — e por isso pega quase todo bug de split ou merge que as outras deixam passar.
