@@ -221,6 +221,11 @@ pub enum Plan {
     Commit,
     /// Ends one, discarding its work.
     Rollback,
+    /// Collapses duplicate rows into one.
+    Distinct {
+        /// Where rows come from.
+        input: Box<Plan>,
+    },
     /// Reclaims the space versions nobody can see are holding.
     Vacuum {
         /// The tables to sweep.
@@ -395,6 +400,15 @@ fn plan_select(pool: &mut BufferPool, catalog: &Catalog, select: &ast::Select) -
         exprs,
         names,
     };
+
+    // Above the projection, because `DISTINCT` is about the output rows and
+    // not about the rows that produced them, and below the limit, because a
+    // limit counts rows that survived the collapse.
+    if select.distinct {
+        plan = Plan::Distinct {
+            input: Box::new(plan),
+        };
+    }
 
     if select.limit.is_some() || select.offset.is_some() {
         plan = Plan::Limit {
@@ -1254,6 +1268,10 @@ impl Plan {
             }
             Plan::Rollback => {
                 let _ = writeln!(out, "{pad}Rollback");
+            }
+            Plan::Distinct { input } => {
+                let _ = writeln!(out, "{pad}Distinct");
+                input.write_explain(out, depth + 1);
             }
             Plan::Vacuum { tables } => {
                 let names: Vec<&str> = tables.iter().map(|table| table.name.as_str()).collect();
