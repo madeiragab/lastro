@@ -91,12 +91,8 @@ mod md5 {
             let mut words = [0u32; 16];
             for (index, word) in words.iter_mut().enumerate() {
                 let at = index * 4;
-                *word = u32::from_le_bytes([
-                    block[at],
-                    block[at + 1],
-                    block[at + 2],
-                    block[at + 3],
-                ]);
+                *word =
+                    u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]]);
             }
 
             let [mut a, mut b, mut c, mut d] = state;
@@ -148,7 +144,9 @@ fn md5_matches_the_published_vectors() {
     );
     // Two blocks, so the chunking is exercised too.
     assert_eq!(
-        md5::hex(b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"),
+        md5::hex(
+            b"12345678901234567890123456789012345678901234567890123456789012345678901234567890"
+        ),
         "57edf4a22be3c955ac49da2e2107b67a"
     );
 }
@@ -287,9 +285,7 @@ fn take_sql<'a, I: Iterator<Item = &'a str>>(lines: &mut std::iter::Peekable<I>)
 }
 
 /// The expected results, which start after the `----` separator.
-fn take_expected<'a, I: Iterator<Item = &'a str>>(
-    lines: &mut std::iter::Peekable<I>,
-) -> Expected {
+fn take_expected<'a, I: Iterator<Item = &'a str>>(lines: &mut std::iter::Peekable<I>) -> Expected {
     // Step over the separator, if the record has one. A query with no results
     // at all has none.
     if lines.peek().map(|line| line.trim_end()) == Some("----") {
@@ -647,12 +643,18 @@ fn the_sqlite_corpus() {
     println!("|---|---|");
     println!("| Files considered | {} |", report.files_seen);
     println!("| Files run to the end | {} |", report.files_finished);
-    println!("| Files abandoned at setup | {} |", report.files_abandoned.len());
+    println!(
+        "| Files abandoned at setup | {} |",
+        report.files_abandoned.len()
+    );
     println!("| Records aimed at another engine | {} |", report.foreign);
     println!("| Assertions attempted | {} |", report.attempted);
     println!("| Passed | {} |", report.passed);
     println!("| Failed | {} |", report.wrong.len());
-    println!("| Skipped, feature not implemented | {} |", report.skipped());
+    println!(
+        "| Skipped, feature not implemented | {} |",
+        report.skipped()
+    );
     println!("\nPass rate over what ran: {rate:.1}%");
     println!(
         "Share of the corpus that could run at all: {coverage:.1}%  \
