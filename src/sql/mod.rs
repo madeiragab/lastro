@@ -28,6 +28,7 @@ pub mod catalog;
 pub mod engine;
 pub mod exec;
 pub mod lexer;
+pub mod mvcc;
 pub mod parser;
 pub mod plan;
 
@@ -40,5 +41,6 @@ pub use catalog::{Catalog, ColumnSchema, TableSchema};
 pub use engine::{Database, Outcome};
 pub use exec::Row;
 pub use lexer::{tokenize, Keyword, Token, TokenKind};
+pub use mvcc::{Snapshot, Version};
 pub use parser::{parse, parse_many};
 pub use plan::{Plan, PlanExpr};
