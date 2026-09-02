@@ -40,6 +40,8 @@ pub struct Database {
     /// Whether a `BEGIN` is outstanding. Without one, each write gets its own
     /// transaction.
     explicit: bool,
+    /// How many rows a sort holds before it writes a run out.
+    sort_budget: usize,
     report: RecoveryReport,
 }
 
@@ -77,8 +79,17 @@ impl Database {
             pool,
             catalog,
             explicit: false,
+            sort_budget: exec::DEFAULT_SORT_ROWS,
             report,
         })
+    }
+
+    /// Sets how many rows a sort may hold before spilling to disk.
+    ///
+    /// Exists so that a test can force the spill path with a handful of rows
+    /// rather than by generating enough to reach the real budget.
+    pub fn set_sort_budget(&mut self, rows: usize) {
+        self.sort_budget = rows.max(1);
     }
 
     /// What recovery found when the database was opened.
@@ -143,7 +154,7 @@ impl Database {
             ast::Statement::Select(_) => {
                 let plan = plan(&mut self.pool, &self.catalog, statement)?;
                 let columns = plan.output_names();
-                let mut op = exec::build(&plan, &mut self.pool)?;
+                let mut op = exec::build_with(&plan, &mut self.pool, self.sort_budget)?;
                 let mut rows = Vec::new();
                 while let Some(row) = op.next(&mut self.pool)? {
                     rows.push(row);
