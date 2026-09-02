@@ -1231,11 +1231,7 @@ pub struct VacuumReport {
 /// be reclaimed however often this runs. In Postgres that is called bloat and
 /// it causes half the production incidents with that database. The mitigation
 /// here is the same one — the horizon is reported, so the cause is visible.
-pub fn vacuum(
-    pool: &mut BufferPool,
-    table: &TableSchema,
-    horizon: TxId,
-) -> Result<VacuumReport> {
+pub fn vacuum(pool: &mut BufferPool, table: &TableSchema, horizon: TxId) -> Result<VacuumReport> {
     let types = column_types(table);
     let mut report = VacuumReport::default();
 
