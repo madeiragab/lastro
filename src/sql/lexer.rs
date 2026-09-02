@@ -35,8 +35,12 @@ pub enum Keyword {
     Default,
     /// `DELETE`
     Delete,
+    /// `ALL`
+    All,
     /// `DESC`
     Desc,
+    /// `DISTINCT`
+    Distinct,
     /// `EXISTS`
     Exists,
     /// `EXPLAIN`
@@ -124,7 +128,9 @@ impl Keyword {
             "CREATE" => Create,
             "DEFAULT" => Default,
             "DELETE" => Delete,
+            "ALL" => All,
             "DESC" => Desc,
+            "DISTINCT" => Distinct,
             "EXISTS" => Exists,
             "EXPLAIN" => Explain,
             "FALSE" => False,
@@ -179,7 +185,9 @@ impl Keyword {
             Create => "CREATE",
             Default => "DEFAULT",
             Delete => "DELETE",
+            All => "ALL",
             Desc => "DESC",
+            Distinct => "DISTINCT",
             Exists => "EXISTS",
             Explain => "EXPLAIN",
             False => "FALSE",

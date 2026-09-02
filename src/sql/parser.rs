@@ -160,6 +160,15 @@ impl Parser {
     fn select(&mut self) -> Result<Select> {
         self.expect_word(Keyword::Select)?;
 
+        // `ALL` is the default written out loud, so it is consumed and
+        // forgotten. `DISTINCT` is not.
+        let distinct = if self.eat_word(Keyword::Distinct) {
+            true
+        } else {
+            self.eat_word(Keyword::All);
+            false
+        };
+
         let projection = if self.eat(TokenKind::Star) {
             Projection::Star
         } else {
@@ -230,6 +239,7 @@ impl Parser {
         };
 
         Ok(Select {
+            distinct,
             projection,
             from,
             joins,
@@ -408,17 +418,87 @@ impl Parser {
         }))
     }
 
+    /// The type a name implies, by the rules SQLite uses.
+    ///
+    /// A type name is any run of words up to an optional size in parentheses,
+    /// and what it means is decided by what it contains, not by a list of
+    /// accepted spellings. `VARCHAR(8)` is text because it says CHAR; `FLOAT`
+    /// is real because it says FLOA. The size is parsed and dropped: lastro
+    /// stores whatever fits and a declared width would be a promise it does
+    /// not keep.
+    ///
+    /// See <https://sqlite.org/datatype3.html>, section 3.1.
+    fn type_by_affinity(&mut self) -> Result<DataType> {
+        let mut spelled = String::new();
+        while let TokenKind::Ident(word) = self.peek().clone() {
+            if !spelled.is_empty() {
+                spelled.push(' ');
+            }
+            spelled.push_str(&word.to_uppercase());
+            self.advance();
+        }
+
+        // `(8)` or `(10, 5)`, parsed so the statement can continue, then
+        // thrown away.
+        if self.eat(TokenKind::LeftParen) {
+            loop {
+                match self.peek().clone() {
+                    TokenKind::RightParen => break,
+                    TokenKind::Int(_) | TokenKind::Comma | TokenKind::Minus => {
+                        self.advance();
+                    }
+                    _ => return Err(self.unexpected("a size")),
+                }
+            }
+            self.expect(TokenKind::RightParen)?;
+        }
+
+        Ok(if spelled.contains("INT") {
+            DataType::Integer
+        } else if spelled.contains("CHAR") || spelled.contains("CLOB") || spelled.contains("TEXT") {
+            DataType::Text
+        } else if spelled.contains("BLOB") || spelled.is_empty() {
+            DataType::Blob
+        } else if spelled.contains("REAL") || spelled.contains("FLOA") || spelled.contains("DOUB") {
+            DataType::Real
+        } else {
+            // SQLite's fifth rule is NUMERIC, which lastro does not have. Real
+            // is the closest thing that holds every value NUMERIC would.
+            DataType::Real
+        })
+    }
+
     fn column_def(&mut self) -> Result<ColumnDef> {
         let name = self.expect_name()?;
         let data_type = match self.peek().clone() {
-            TokenKind::Word(Keyword::Integer) => DataType::Integer,
-            TokenKind::Word(Keyword::Real) => DataType::Real,
-            TokenKind::Word(Keyword::Text) => DataType::Text,
-            TokenKind::Word(Keyword::Blob) => DataType::Blob,
-            TokenKind::Word(Keyword::Boolean) => DataType::Boolean,
+            TokenKind::Word(Keyword::Integer) => {
+                self.advance();
+                DataType::Integer
+            }
+            TokenKind::Word(Keyword::Real) => {
+                self.advance();
+                DataType::Real
+            }
+            TokenKind::Word(Keyword::Text) => {
+                self.advance();
+                DataType::Text
+            }
+            TokenKind::Word(Keyword::Blob) => {
+                self.advance();
+                DataType::Blob
+            }
+            TokenKind::Word(Keyword::Boolean) => {
+                self.advance();
+                DataType::Boolean
+            }
+            // Anything else spelled as a name goes through SQLite's affinity
+            // rules. `VARCHAR(8)`, `FLOAT`, `DOUBLE PRECISION` and `UNSIGNED
+            // BIG INT` are all things real schemas say, and refusing them
+            // means refusing the schema rather than refusing a feature.
+            TokenKind::Ident(_) => self.type_by_affinity()?,
             _ => return Err(self.unexpected("a column type")),
         };
-        self.advance();
+        
 
         let mut constraints = Vec::new();
         loop {
@@ -583,6 +663,12 @@ impl Parser {
                     op: UnaryOp::Neg,
                     operand: Box::new(operand),
                 })
+            }
+            // Unary plus is a no-op everywhere it is legal, so it is dropped
+            // here rather than carried through the planner to do nothing.
+            TokenKind::Plus => {
+                self.advance();
+                self.primary()
             }
             TokenKind::LeftParen => {
                 self.advance();
