@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 
 use crate::sql::ast;
 use crate::sql::ast::{BinaryOp, DataType, UnaryOp};
-use crate::sql::catalog::{Catalog, ColumnSchema, TableSchema};
+use crate::sql::catalog::{Catalog, ColumnSchema, IndexSchema, TableSchema};
 use crate::storage::page::encoding::Value;
 use crate::storage::BufferPool;
 use crate::{Error, Result};
@@ -142,6 +142,18 @@ pub enum Plan {
         /// Where each supplied value goes in the table's column order.
         targets: Vec<usize>,
     },
+    /// Finds rows through a secondary index rather than by walking the table.
+    ///
+    /// Two descents instead of a scan: one into the index to find the row ids,
+    /// one into the table for each row.
+    IndexScan {
+        /// The table the rows come from.
+        table: TableSchema,
+        /// The index being read.
+        index: IndexSchema,
+        /// The value its leading column must equal.
+        key: Value,
+    },
     /// Pairs every row of one side with every row of the other, keeping the
     /// pairs the condition admits.
     NestedLoopJoin {
@@ -189,6 +201,13 @@ pub enum Plan {
         /// The upper edge of the row id range to walk.
         upper: Option<Bound>,
     },
+    /// Adds an index to a table.
+    CreateIndex {
+        /// The table to index.
+        table: TableSchema,
+        /// The index to build. Its root page is filled in when it runs.
+        index: IndexSchema,
+    },
     /// Adds a table to the catalog.
     CreateTable {
         /// The schema to record. Its root page is filled in when it runs.
@@ -231,9 +250,7 @@ pub fn plan(pool: &mut BufferPool, catalog: &Catalog, statement: &ast::Statement
         ast::Statement::Explain(_) => Err(Error::Unsupported(
             "EXPLAIN cannot wrap another EXPLAIN".into(),
         )),
-        ast::Statement::CreateIndex(_) => Err(Error::Unsupported(
-            "secondary indexes are not implemented yet".into(),
-        )),
+        ast::Statement::CreateIndex(create) => plan_create_index(pool, catalog, create),
     }
 }
 
@@ -267,16 +284,36 @@ fn plan_select(pool: &mut BufferPool, catalog: &Catalog, select: &ast::Select) -
         _ => (None, None, filter.clone()),
     };
 
-    let mut plan = if lower.is_some() || upper.is_some() {
-        Plan::RowIdScan {
+    // Rule 1 again, one step further out: with no row id range to use, an
+    // equality on the leading column of an index reaches the rows through it
+    // instead of walking every one.
+    let indexed = match (
+        &residual,
+        joined.is_empty(),
+        lower.is_some() || upper.is_some(),
+    ) {
+        (Some(predicate), true, false) => index_lookup(predicate, &table),
+        _ => None,
+    };
+
+    let mut plan = match (&indexed, lower.is_some() || upper.is_some()) {
+        (Some((index, key, _)), _) => Plan::IndexScan {
+            table: table.clone(),
+            index: (*index).clone(),
+            key: key.clone(),
+        },
+        (None, true) => Plan::RowIdScan {
             table: table.clone(),
             lower,
             upper,
-        }
-    } else {
-        Plan::SeqScan {
+        },
+        (None, false) => Plan::SeqScan {
             table: table.clone(),
-        }
+        },
+    };
+    let residual = match indexed {
+        Some((_, _, leftover)) => leftover,
+        None => residual,
     };
 
     // Rule 4, join selection. An equality with one side reading only the left
@@ -394,15 +431,72 @@ fn plan_delete(pool: &mut BufferPool, catalog: &Catalog, delete: &ast::Delete) -
     })
 }
 
+/// Finds an index an equality in the predicate can be answered through.
+///
+/// Equality on the leading column only. A range over an index is a natural next
+/// step and is left out rather than half done: getting the edges of a composite
+/// key right is exactly the kind of detail that is wrong in silence.
+fn index_lookup<'a>(
+    predicate: &PlanExpr,
+    table: &'a TableSchema,
+) -> Option<(&'a IndexSchema, Value, Option<PlanExpr>)> {
+    let mut conjuncts = Vec::new();
+    flatten_and(predicate, &mut conjuncts);
+
+    let mut chosen = None;
+    let mut residual = Vec::new();
+
+    for conjunct in conjuncts {
+        if chosen.is_none() {
+            if let Some((column, value)) = equality_of(&conjunct) {
+                if let Some(index) = table.index_leading_on(column) {
+                    chosen = Some((index, value));
+                    continue;
+                }
+            }
+        }
+        residual.push(conjunct);
+    }
+
+    let (index, value) = chosen?;
+    let leftover = residual.into_iter().reduce(|left, right| PlanExpr::Binary {
+        left: Box::new(left),
+        op: BinaryOp::And,
+        right: Box::new(right),
+    });
+    Some((index, value, leftover))
+}
+
+/// The column and constant an equality compares, written either way round.
+fn equality_of(expr: &PlanExpr) -> Option<(usize, Value)> {
+    let PlanExpr::Binary {
+        left,
+        op: BinaryOp::Eq,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (PlanExpr::Column(index), PlanExpr::Const(value))
+        | (PlanExpr::Const(value), PlanExpr::Column(index)) => {
+            // A null equals nothing, so it can never be an index lookup.
+            if matches!(value, Value::Null) {
+                None
+            } else {
+                Some((*index, value.clone()))
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Splits a join condition into the equality a hash join can use and the rest.
 ///
 /// The equality qualifies only when one side reads columns from the left input
 /// alone and the other from the right alone. Anything mixed has to be evaluated
 /// on the joined row, which is what a nested loop does.
-fn hash_keys(
-    on: &PlanExpr,
-    boundary: usize,
-) -> Option<(PlanExpr, PlanExpr, Option<PlanExpr>)> {
+fn hash_keys(on: &PlanExpr, boundary: usize) -> Option<(PlanExpr, PlanExpr, Option<PlanExpr>)> {
     let mut conjuncts = Vec::new();
     flatten_and(on, &mut conjuncts);
 
@@ -519,6 +613,41 @@ fn plan_insert(pool: &mut BufferPool, catalog: &Catalog, insert: &ast::Insert) -
     })
 }
 
+fn plan_create_index(
+    pool: &mut BufferPool,
+    catalog: &Catalog,
+    create: &ast::CreateIndex,
+) -> Result<Plan> {
+    let table = catalog.require(pool, &create.table)?;
+    if table
+        .indexes
+        .iter()
+        .any(|index| index.name.eq_ignore_ascii_case(&create.name))
+    {
+        return Err(Error::TableExists(create.name.clone()));
+    }
+
+    let columns = create
+        .columns
+        .iter()
+        .map(|name| {
+            table
+                .column_index(name)
+                .ok_or_else(|| Error::UnknownColumn(name.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Plan::CreateIndex {
+        table,
+        index: IndexSchema {
+            name: create.name.clone(),
+            root: crate::NO_PAGE,
+            unique: create.unique,
+            columns,
+        },
+    })
+}
+
 fn plan_create_table(create: &ast::CreateTable) -> Result<Plan> {
     let mut columns = Vec::with_capacity(create.columns.len());
     for column in &create.columns {
@@ -527,6 +656,7 @@ fn plan_create_table(create: &ast::CreateTable) -> Result<Plan> {
             data_type: column.data_type,
             not_null: false,
             primary_key: false,
+            unique: false,
             default: None,
         };
         for constraint in &column.constraints {
@@ -536,11 +666,7 @@ fn plan_create_table(create: &ast::CreateTable) -> Result<Plan> {
                     schema.not_null = true;
                 }
                 ast::ColumnConstraint::NotNull => schema.not_null = true,
-                ast::ColumnConstraint::Unique => {
-                    return Err(Error::Unsupported(
-                        "UNIQUE needs a secondary index, which is not implemented yet".into(),
-                    ))
-                }
+                ast::ColumnConstraint::Unique => schema.unique = true,
                 ast::ColumnConstraint::Default(literal) => {
                     schema.default = Some(literal_value(literal))
                 }
@@ -565,6 +691,7 @@ fn plan_create_table(create: &ast::CreateTable) -> Result<Plan> {
             name: create.name.clone(),
             root: crate::NO_PAGE,
             columns,
+            indexes: Vec::new(),
         },
         if_not_exists: create.if_not_exists,
     })
@@ -1040,6 +1167,18 @@ impl Plan {
             }
             Plan::Insert { table, rows, .. } => {
                 let _ = writeln!(out, "{pad}Insert {} ({} rows)", table.name, rows.len());
+            }
+            Plan::IndexScan { table, index, key } => {
+                let _ = writeln!(
+                    out,
+                    "{pad}IndexScan {} using {} (= {})",
+                    table.name,
+                    index.name,
+                    describe_value(key)
+                );
+            }
+            Plan::CreateIndex { table, index } => {
+                let _ = writeln!(out, "{pad}CreateIndex {} on {}", index.name, table.name);
             }
             Plan::NestedLoopJoin { left, right, on } => {
                 let _ = writeln!(out, "{pad}NestedLoopJoin {}", describe(on));

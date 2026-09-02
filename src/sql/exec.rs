@@ -10,10 +10,10 @@ use std::collections::HashMap;
 
 use crate::index::{BTree, Cursor};
 use crate::sql::ast::{BinaryOp, DataType, UnaryOp};
-use crate::sql::catalog::TableSchema;
+use crate::sql::catalog::{IndexSchema, TableSchema};
 use crate::sql::plan::{Bound, Plan, PlanExpr};
 use crate::storage::page::encoding::{
-    decode_tuple, encode_i64, encode_key, encode_tuple, Value, ValueType,
+    decode_i64, decode_tuple, encode_i64, encode_key, encode_tuple, Value, ValueType,
 };
 use crate::storage::BufferPool;
 use crate::{Error, Result};
@@ -265,6 +265,15 @@ pub enum Op {
         /// Where in the tree the scan is.
         cursor: Cursor,
     },
+    /// Walks an index and fetches the row each entry points at.
+    IndexScan {
+        /// The column types, for decoding a row.
+        types: Vec<ValueType>,
+        /// The tree holding the rows.
+        table_root: crate::PageId,
+        /// Where in the index the walk is.
+        cursor: Cursor,
+    },
     /// Drops rows the predicate does not admit.
     Filter {
         /// Where rows come from.
@@ -346,6 +355,30 @@ impl Op {
                     .ok_or_else(|| Error::MalformedFile("a row that does not decode".into())),
                 None => Ok(None),
             },
+
+            Op::IndexScan {
+                types,
+                table_root,
+                cursor,
+            } => {
+                let Some((key, _)) = cursor.next(pool)? else {
+                    return Ok(None);
+                };
+                // The row id rides at the end of every index key, which is what
+                // turns a match into a second descent rather than a scan.
+                let rowid = rowid_of(&key)?;
+                let table = BTree::open(*table_root);
+                match table.get(pool, &encode_i64(rowid))? {
+                    Some(encoded) => decode_tuple(&encoded, types)
+                        .map(Some)
+                        .ok_or_else(|| Error::MalformedFile("a row that does not decode".into())),
+                    // An index entry with no row behind it means the two have
+                    // drifted apart, which is corruption rather than an absence.
+                    None => Err(Error::MalformedFile(format!(
+                        "an index points at row {rowid}, which is not there"
+                    ))),
+                }
+            }
 
             Op::Filter { input, predicate } => loop {
                 let Some(row) = input.next(pool)? else {
@@ -598,6 +631,19 @@ pub fn build(plan: &Plan, pool: &mut BufferPool) -> Result<Op> {
             built: None,
             pending: Vec::new(),
         },
+        Plan::IndexScan { table, index, key } => {
+            let prefix = index_prefix(std::slice::from_ref(key))?;
+            let upper = successor(&prefix);
+            Op::IndexScan {
+                types: column_types(table),
+                table_root: table.root,
+                cursor: BTree::open(index.root).cursor_range(
+                    pool,
+                    Some(&prefix),
+                    upper.as_deref(),
+                )?,
+            }
+        }
         Plan::Filter { input, predicate } => Op::Filter {
             input: Box::new(build(input, pool)?),
             predicate: predicate.clone(),
@@ -644,6 +690,169 @@ fn column_types(table: &TableSchema) -> Vec<ValueType> {
 }
 
 // -- writing ---------------------------------------------------------------
+
+// -- indexes ---------------------------------------------------------------
+
+/// The key one row takes in one index: the indexed values, then the row id.
+fn index_key(index: &IndexSchema, row: &[Value], rowid: i64) -> Result<Vec<u8>> {
+    let values: Vec<Value> = index
+        .columns
+        .iter()
+        .map(|position| row[*position].clone())
+        .collect();
+    let mut key = index_prefix(&values)?;
+    key.extend_from_slice(&encode_i64(rowid));
+    Ok(key)
+}
+
+/// The part of an index key that comes before the row id.
+fn index_prefix(values: &[Value]) -> Result<Vec<u8>> {
+    let mut key = Vec::new();
+    encode_key(values, &mut key)?;
+    Ok(key)
+}
+
+/// The smallest key that sorts after everything starting with `prefix`.
+///
+/// `None` when there is none, which only happens for a prefix of all `0xFF`
+/// bytes: the range then runs to the end of the index and needs no upper edge.
+fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    for byte in out.iter_mut().rev() {
+        if *byte < 0xFF {
+            *byte += 1;
+            return Some(out);
+        }
+        *byte = 0;
+    }
+    None
+}
+
+/// The row id an index key ends with.
+fn rowid_of(key: &[u8]) -> Result<i64> {
+    let tail = key
+        .len()
+        .checked_sub(8)
+        .and_then(|at| key.get(at..))
+        .ok_or_else(|| Error::MalformedFile("an index key with no row id".into()))?;
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(tail);
+    Ok(decode_i64(bytes))
+}
+
+/// Adds one row to every index on its table.
+fn index_row(pool: &mut BufferPool, table: &TableSchema, row: &[Value], rowid: i64) -> Result<()> {
+    for index in &table.indexes {
+        if index.unique {
+            let values: Vec<Value> = index
+                .columns
+                .iter()
+                .map(|position| row[*position].clone())
+                .collect();
+            // A null is not equal to anything, not even another null, so it
+            // cannot collide and a unique index lets any number of them in.
+            if !values.iter().any(|value| matches!(value, Value::Null))
+                && index_holds(pool, index, &values, rowid)?
+            {
+                return Err(Error::NotUnique(index.name.clone()));
+            }
+        }
+        let mut tree = BTree::open(index.root);
+        tree.insert(pool, &index_key(index, row, rowid)?, &[])?;
+    }
+    Ok(())
+}
+
+/// Removes one row from every index on its table.
+fn unindex_row(
+    pool: &mut BufferPool,
+    table: &TableSchema,
+    row: &[Value],
+    rowid: i64,
+) -> Result<()> {
+    for index in &table.indexes {
+        let mut tree = BTree::open(index.root);
+        tree.delete(pool, &index_key(index, row, rowid)?)?;
+    }
+    Ok(())
+}
+
+/// Whether an index already holds `values` under some row other than `rowid`.
+fn index_holds(
+    pool: &mut BufferPool,
+    index: &IndexSchema,
+    values: &[Value],
+    rowid: i64,
+) -> Result<bool> {
+    let prefix = index_prefix(values)?;
+    let upper = successor(&prefix);
+    let tree = BTree::open(index.root);
+    let mut cursor = tree.cursor_range(pool, Some(&prefix), upper.as_deref())?;
+    while let Some((key, _)) = cursor.next(pool)? {
+        if rowid_of(&key)? != rowid {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Builds an index over the rows a table already holds.
+pub fn build_index(
+    pool: &mut BufferPool,
+    table: &TableSchema,
+    index: &IndexSchema,
+) -> Result<usize> {
+    let types = column_types(table);
+    let mut entries = Vec::new();
+    {
+        let tree = BTree::open(table.root);
+        let mut cursor = tree.cursor(pool, None)?;
+        while let Some((key, encoded)) = cursor.next(pool)? {
+            let row = decode_tuple(&encoded, &types)
+                .ok_or_else(|| Error::MalformedFile("a row that does not decode".into()))?;
+            let mut rowid_bytes = [0u8; 8];
+            rowid_bytes.copy_from_slice(&key);
+            entries.push((decode_i64(rowid_bytes), row));
+        }
+    }
+
+    let mut tree = BTree::open(index.root);
+    for (rowid, row) in &entries {
+        if index.unique {
+            let values = index_values(index, row);
+            // The rows arrive in row id order, not index order, so a duplicate
+            // need not be adjacent to its twin. Asking the half built tree
+            // catches it wherever it sits.
+            if !values.iter().any(|value| matches!(value, Value::Null))
+                && index_holds(pool, index, &values, *rowid)?
+            {
+                return Err(Error::NotUnique(index.name.clone()));
+            }
+        }
+        tree.insert(pool, &index_key(index, row, *rowid)?, &[])?;
+    }
+    Ok(entries.len())
+}
+
+/// The row id a table key is, as opposed to the one an index key ends with.
+fn rowid_of_row_key(key: &[u8]) -> Result<i64> {
+    if key.len() != 8 {
+        return Err(Error::MalformedFile(
+            "a table key that is not a row id".into(),
+        ));
+    }
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(key);
+    Ok(decode_i64(bytes))
+}
+
+fn index_values(index: &IndexSchema, row: &[Value]) -> Vec<Value> {
+    index
+        .columns
+        .iter()
+        .map(|position| row[*position].clone())
+        .collect()
+}
 
 /// The rows a write is about to touch, gathered before any of them change.
 ///
@@ -711,7 +920,8 @@ pub fn delete(
 ) -> Result<usize> {
     let matched = gather(pool, table, filter, lower, upper)?;
     let mut tree = BTree::open(table.root);
-    for (key, _) in &matched {
+    for (key, row) in &matched {
+        unindex_row(pool, table, row, rowid_of_row_key(key)?)?;
         tree.delete(pool, key)?;
     }
     Ok(matched.len())
@@ -760,10 +970,15 @@ pub fn update(
 
         let mut encoded = Vec::new();
         encode_tuple(&updated, &mut encoded);
+
+        let old_rowid = rowid_of_row_key(key)?;
+        let new_rowid = rowid_of_row_key(&new_key)?;
+        unindex_row(pool, table, row, old_rowid)?;
         if new_key != *key {
             tree.delete(pool, key)?;
         }
         tree.insert(pool, &new_key, &encoded)?;
+        index_row(pool, table, &updated, new_rowid)?;
     }
     Ok(matched.len())
 }
@@ -830,6 +1045,7 @@ pub fn insert(
         let mut encoded = Vec::new();
         encode_tuple(&values, &mut encoded);
         tree.insert(pool, &encode_i64(rowid), &encoded)?;
+        index_row(pool, table, &values, rowid)?;
     }
     Ok(rows.len())
 }
