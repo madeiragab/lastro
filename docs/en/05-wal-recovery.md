@@ -271,6 +271,25 @@ flowchart TD
     NEXT --> S
 ```
 
+### Why power loss, and not `SIGKILL`
+
+Killing the process is the obvious way to simulate a crash, and it does not test what needs
+testing. A killed process loses its own buffers, but every write that already reached the
+operating system is still in the page cache, and the kernel writes it out afterwards regardless.
+The data survives, the WAL rule is never put under any pressure, and the test passes whether or
+not the rule is even there.
+
+Power loss is different: **only what was `fsync`ed survives.** That is the condition the whole
+write-ahead log exists to handle, so that is what is modelled. Writes are held back until a sync
+makes them durable, and the crash discards whatever had not got there.
+
+Power goes at the *n*-th sync point, and at that point only a prefix of what was pending actually
+lands — which also produces the torn log tail that the per-record checksums are there to catch.
+
+**What is not modelled:** a page write torn in the middle. Data pages carry no checksum, so half
+a page would be undetectable. The usual answer is to write full page images after every
+checkpoint, and that is recorded as future work rather than left out.
+
 **Why `SIGKILL` and not an exception:** `SIGKILL` cannot be caught. No destructor runs, no buffer
 is flushed, no `Drop` happens. It is the most faithful simulation of power loss achievable
 without hardware.
