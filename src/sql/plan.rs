@@ -371,7 +371,12 @@ fn plan_select(pool: &mut BufferPool, catalog: &Catalog, select: &ast::Select) -
     let keys: Vec<(PlanExpr, bool)> = select
         .order_by
         .iter()
-        .map(|item| Ok((bind_expr(&scope, &item.expr)?, item.descending)))
+        .map(|item| {
+            Ok((
+                bind_order_key(&scope, &select.projection, &item.expr)?,
+                item.descending,
+            ))
+        })
         .collect::<Result<_>>()?;
 
     let already_ordered = match (table.rowid_column(), select.joins.is_empty()) {
@@ -884,6 +889,42 @@ fn rebase(expr: &PlanExpr, delta: usize) -> PlanExpr {
             high: Box::new(rebase(high, delta)),
             negated: *negated,
         },
+    }
+}
+
+/// Binds one `ORDER BY` key, resolving an ordinal against the output columns.
+///
+/// `ORDER BY 1` means the first output column and not the number one. Read
+/// literally it sorts by a constant, which is a no-op, so the rows come back in
+/// whatever order the scan produced -- every value correct, the order wrong,
+/// and no error anywhere to say so. SQLite's corpus found this in 43 places.
+fn bind_order_key(
+    scope: &Scope,
+    projection: &ast::Projection,
+    expr: &ast::Expr,
+) -> Result<PlanExpr> {
+    let ast::Expr::Literal(ast::Literal::Int(ordinal)) = expr else {
+        return bind_expr(scope, expr);
+    };
+
+    let width = match projection {
+        ast::Projection::Star => scope.width(),
+        ast::Projection::Items(items) => items.len(),
+    };
+    if *ordinal < 1 || *ordinal as usize > width {
+        return Err(Error::Sql {
+            message: format!("ORDER BY {ordinal} names an output column, and there are {width}"),
+            at: 0,
+        });
+    }
+
+    let index = *ordinal as usize - 1;
+    match projection {
+        ast::Projection::Star => Ok(PlanExpr::Column(index)),
+        // The sort sits below the projection, so the key has to be the
+        // expression that output column is computed from, not the column
+        // itself -- it does not exist yet.
+        ast::Projection::Items(items) => bind_expr(scope, &items[index].expr),
     }
 }
 
