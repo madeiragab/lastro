@@ -29,7 +29,8 @@ number only goes in after it has been measured.
 | B+Tree transactional over the log | done |
 | Crash fuzzer | done |
 | SQL: lexer, syntax tree, parser | done |
-| SQL: binder, catalog, planner, executor | not started |
+| SQL: catalog, binder, planner, executor | done for a single table |
+| SQL: joins, secondary indexes, UPDATE, DELETE | not started |
 | MVCC / snapshot isolation | not started |
 | Proof suite | partial: model and property tests done, crash fuzzer not |
 
@@ -124,7 +125,30 @@ project. Details in [05 · WAL and recovery](docs/en/05-wal-recovery.md) and
 
 ## Running it
 
-The tests, model-based and property-based ones included:
+A whole session, from nothing:
+
+```bash
+cargo run --bin lastro-cli -- sql herd.lastro "
+  CREATE TABLE cattle (id INTEGER PRIMARY KEY, tag TEXT NOT NULL, weight REAL);
+  INSERT INTO cattle VALUES (1, 'BR-0042', 431.5), (2, 'BR-0043', 380.0);
+  SELECT tag, weight FROM cattle WHERE weight > 400;
+"
+```
+
+And the plan the database chose, which is where the planner's rules become visible:
+
+```bash
+cargo run --bin lastro-cli -- sql herd.lastro "EXPLAIN SELECT * FROM cattle WHERE id = 1"
+```
+
+```
+RowIdScan cattle (= 1)
+```
+
+A comparison against the primary key stops being a scan and becomes a descent, because the
+primary key **is** the key of the table's own tree. Without it that line reads `SeqScan`.
+
+The tests, model-based, property-based and the crash fuzzer included:
 
 ```bash
 cargo test

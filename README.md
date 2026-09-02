@@ -29,7 +29,8 @@ número só entra depois de medido.
 | B+Tree transacional sobre o log | concluído |
 | Crash fuzzer | concluído |
 | SQL: lexer, árvore sintática, parser | concluído |
-| SQL: binder, catálogo, planner, executor | não começado |
+| SQL: catálogo, binder, planner, executor | concluído para uma tabela |
+| SQL: junções, índices secundários, UPDATE, DELETE | não começado |
 | MVCC / snapshot isolation | não começado |
 | Suíte de provas | parcial: modelo e propriedade prontos, crash fuzzer não |
 
@@ -121,7 +122,30 @@ Detalhes em [05 · WAL e recovery](docs/pt/05-wal-recovery.md) e [08 · Testes](
 
 ## Como rodar
 
-Testes, incluindo os de modelo e os baseados em propriedade:
+Uma sessão inteira, do zero:
+
+```bash
+cargo run --bin lastro-cli -- sql rebanho.lastro "
+  CREATE TABLE gado (id INTEGER PRIMARY KEY, brinco TEXT NOT NULL, peso REAL);
+  INSERT INTO gado VALUES (1, 'BR-0042', 431.5), (2, 'BR-0043', 380.0);
+  SELECT brinco, peso FROM gado WHERE peso > 400;
+"
+```
+
+E o plano que o banco escolheu, que é onde as regras do planner ficam visíveis:
+
+```bash
+cargo run --bin lastro-cli -- sql rebanho.lastro "EXPLAIN SELECT * FROM gado WHERE id = 1"
+```
+
+```
+RowIdScan gado (= 1)
+```
+
+Uma comparação com a chave primária deixa de ser varredura e vira descida, porque a chave
+primária **é** a chave da árvore da tabela. Sem ela seria `SeqScan`.
+
+Testes, incluindo os de modelo, os baseados em propriedade e o crash fuzzer:
 
 ```bash
 cargo test
