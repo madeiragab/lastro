@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # The long crash fuzzer run, nightly.
+    - cron: "0 4 * * *"
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -72,3 +76,17 @@ jobs:
         run: rustup update stable && rustup default stable
       - name: Test
         run: cargo test --all-targets
+
+  fuzz:
+    name: crash fuzzer, long run
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup update stable && rustup default stable
+      - name: Cut the power twenty thousand times
+        env:
+          LASTRO_FUZZ_SEEDS: "20000"
+        run: cargo test --release --test crash_fuzz -- --nocapture
