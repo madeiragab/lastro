@@ -1425,7 +1425,10 @@ fn order_by_an_ordinal_names_an_output_column() {
 
     let by_second = rows(&mut db, "SELECT b, a FROM t ORDER BY 2 DESC");
     assert_eq!(
-        by_second.iter().map(|row| row[1].clone()).collect::<Vec<_>>(),
+        by_second
+            .iter()
+            .map(|row| row[1].clone())
+            .collect::<Vec<_>>(),
         vec![Value::Int(3), Value::Int(2), Value::Int(1)]
     );
 }

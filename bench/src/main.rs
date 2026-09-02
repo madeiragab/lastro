@@ -318,7 +318,12 @@ fn load(engine: &mut dyn Engine, rows: usize) {
 
 /// Runs a workload `runs` times, each against a database opened for it, and
 /// returns the durations sorted.
-fn measure<E: Engine, F: Fn() -> E>(open: F, work: &Workload, rows: usize, runs: usize) -> Vec<Duration> {
+fn measure<E: Engine, F: Fn() -> E>(
+    open: F,
+    work: &Workload,
+    rows: usize,
+    runs: usize,
+) -> Vec<Duration> {
     let mut times = Vec::with_capacity(runs);
     for _ in 0..runs {
         let mut engine = open();
