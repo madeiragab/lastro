@@ -625,6 +625,18 @@ pub enum Op {
         pending: Vec<Row>,
     },
     /// Counts and stops.
+    /// Yields a row the first time it is seen and never again.
+    ///
+    /// Unlike [`Op::Sort`] this one has no spill: the set of rows already
+    /// yielded is held in memory, so `SELECT DISTINCT` over more distinct rows
+    /// than fit will run out. Saying so is better than a spill that has not
+    /// been written; see `docs/en/06-sql.md`.
+    Distinct {
+        /// Where rows come from.
+        input: Box<Op>,
+        /// A fingerprint of every row already yielded.
+        seen: std::collections::HashSet<Vec<u8>>,
+    },
     Limit {
         /// Where rows come from.
         input: Box<Op>,
@@ -854,6 +866,24 @@ impl Op {
                 }
             }
 
+            Op::Distinct { input, seen } => {
+                // A row is its own key. `encode_key` is reused rather than a
+                // second encoding invented, for the reason `hash_key` gives:
+                // it already turns any value into bytes, nulls included, and
+                // bytes hash.
+                loop {
+                    match input.next(pool)? {
+                        None => return Ok(None),
+                        Some(row) => {
+                            let mut key = Vec::new();
+                            encode_key(&row, &mut key)?;
+                            if seen.insert(key) {
+                                return Ok(Some(row));
+                            }
+                        }
+                    }
+                }
+            }
             Op::Limit {
                 input,
                 remaining,
@@ -1019,6 +1049,10 @@ pub fn build_with(
             buffered: None,
             yielded: 0,
             drained: false,
+        },
+        Plan::Distinct { input } => Op::Distinct {
+            input: Box::new(build_with(input, pool, snapshot, budget)?),
+            seen: std::collections::HashSet::new(),
         },
         Plan::Limit {
             input,
