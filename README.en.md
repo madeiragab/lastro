@@ -4,9 +4,10 @@
 
 [![CI](https://github.com/madeiragab/lastro/actions/workflows/ci.yml/badge.svg)](https://github.com/madeiragab/lastro/actions/workflows/ci.yml)
 
-> **[Run the database in your browser](https://madeiragab.github.io/lastro/)** — the real engine compiled to
-> WebAssembly, with nothing to install. The same pager, the same B+Tree, the same log; only the
-> disk becomes a file in memory inside your tab.
+[![Demo](https://img.shields.io/badge/demo-run%20in%20your%20browser-c2410c?style=for-the-badge&logo=webassembly&logoColor=white)](https://madeiragab.github.io/lastro/)
+
+> The real engine compiled to WebAssembly, with nothing to install. The same pager, the same
+> B+Tree, the same log; only the disk becomes a file in memory inside your tab.
 
 **An embedded relational database, written from scratch in Rust.**
 
