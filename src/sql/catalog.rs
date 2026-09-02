@@ -36,8 +36,28 @@ pub struct ColumnSchema {
     pub not_null: bool,
     /// Whether it is the primary key.
     pub primary_key: bool,
+    /// Whether the schema asked for it to be unique.
+    pub unique: bool,
     /// What to store when a statement leaves it out.
     pub default: Option<Value>,
+}
+
+/// One secondary index.
+///
+/// A tree whose keys are the indexed columns followed by the row id, and whose
+/// values are empty. The row id rides in the key so that two rows sharing an
+/// index value stay distinct entries, and so that a match hands back the row to
+/// fetch without a second structure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexSchema {
+    /// The index's name.
+    pub name: String,
+    /// The root of its tree.
+    pub root: PageId,
+    /// Whether two rows may share a key.
+    pub unique: bool,
+    /// Which columns it covers, by position in the table.
+    pub columns: Vec<usize>,
 }
 
 /// One table.
@@ -49,6 +69,8 @@ pub struct TableSchema {
     pub root: PageId,
     /// Its columns, in the order they were declared.
     pub columns: Vec<ColumnSchema>,
+    /// Its secondary indexes.
+    pub indexes: Vec<IndexSchema>,
 }
 
 impl TableSchema {
@@ -62,6 +84,16 @@ impl TableSchema {
     /// The column at a position.
     pub fn column(&self, index: usize) -> &ColumnSchema {
         &self.columns[index]
+    }
+
+    /// The index whose leading column is `column`, if there is one.
+    ///
+    /// Leading, because an index on `(a, b)` orders by `a` first: a predicate
+    /// on `b` alone reaches nothing the index can narrow.
+    pub fn index_leading_on(&self, column: usize) -> Option<&IndexSchema> {
+        self.indexes
+            .iter()
+            .find(|index| index.columns.first() == Some(&column))
     }
 }
 
@@ -172,6 +204,9 @@ fn encode_table(schema: &TableSchema, out: &mut Vec<u8>) {
         if column.primary_key {
             flags |= 0b0000_0010;
         }
+        if column.unique {
+            flags |= 0b0000_0100;
+        }
         out.push(flags);
         match &column.default {
             None => out.push(0),
@@ -179,6 +214,17 @@ fn encode_table(schema: &TableSchema, out: &mut Vec<u8>) {
                 out.push(1);
                 encode_value(value, out);
             }
+        }
+    }
+
+    put_varint(out, schema.indexes.len() as u64);
+    for index in &schema.indexes {
+        put_bytes(out, index.name.as_bytes());
+        put_varint(out, index.root as u64);
+        out.push(u8::from(index.unique));
+        put_varint(out, index.columns.len() as u64);
+        for column in &index.columns {
+            put_varint(out, *column as u64);
         }
     }
 }
@@ -207,7 +253,36 @@ fn decode_table(bytes: &[u8]) -> Result<TableSchema> {
             data_type,
             not_null: flags & 0b0000_0001 != 0,
             primary_key: flags & 0b0000_0010 != 0,
+            unique: flags & 0b0000_0100 != 0,
             default,
+        });
+    }
+
+    let (index_count, read) =
+        get_varint(input).ok_or_else(|| malformed("a truncated index count"))?;
+    input = &input[read..];
+    let mut indexes = Vec::with_capacity(index_count as usize);
+    for _ in 0..index_count {
+        let name = String::from_utf8(take_bytes(&mut input)?.to_vec())
+            .map_err(|_| malformed("an index name that is not text"))?;
+        let (root, read) = get_varint(input).ok_or_else(|| malformed("a truncated index root"))?;
+        input = &input[read..];
+        let unique = take_byte(&mut input)? != 0;
+        let (count, read) =
+            get_varint(input).ok_or_else(|| malformed("a truncated index column count"))?;
+        input = &input[read..];
+        let mut columns = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let (column, read) =
+                get_varint(input).ok_or_else(|| malformed("a truncated index column"))?;
+            input = &input[read..];
+            columns.push(column as usize);
+        }
+        indexes.push(IndexSchema {
+            name,
+            root: root as PageId,
+            unique,
+            columns,
         });
     }
 
@@ -215,6 +290,7 @@ fn decode_table(bytes: &[u8]) -> Result<TableSchema> {
         name,
         root: root as PageId,
         columns,
+        indexes,
     })
 }
 
@@ -302,12 +378,19 @@ mod tests {
         TableSchema {
             name: "gado".into(),
             root: 42,
+            indexes: vec![IndexSchema {
+                name: "idx_brinco".into(),
+                root: 77,
+                unique: true,
+                columns: vec![1],
+            }],
             columns: vec![
                 ColumnSchema {
                     name: "id".into(),
                     data_type: DataType::Integer,
                     not_null: true,
                     primary_key: true,
+                    unique: false,
                     default: None,
                 },
                 ColumnSchema {
@@ -315,6 +398,7 @@ mod tests {
                     data_type: DataType::Text,
                     not_null: true,
                     primary_key: false,
+                    unique: false,
                     default: Some(Value::Text("sem brinco".into())),
                 },
                 ColumnSchema {
@@ -322,6 +406,7 @@ mod tests {
                     data_type: DataType::Real,
                     not_null: false,
                     primary_key: false,
+                    unique: false,
                     default: Some(Value::Real(0.0)),
                 },
                 ColumnSchema {
@@ -329,6 +414,7 @@ mod tests {
                     data_type: DataType::Boolean,
                     not_null: false,
                     primary_key: false,
+                    unique: false,
                     default: Some(Value::Bool(true)),
                 },
             ],
