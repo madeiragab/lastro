@@ -1,0 +1,102 @@
+name: site
+
+# The database itself, compiled to WebAssembly and served from GitHub Pages, so
+# that anybody can run it without installing Rust. It is the real engine — the
+# same pager, the same B+Tree, the same write-ahead log — with a virtual file
+# system underneath instead of a disk.
+
+on:
+  push:
+    branches: [main]
+  # A pull request builds the site but does not publish it, so a change that
+  # breaks the WebAssembly build is caught before it reaches the published page.
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and a queued one supersedes rather than piles up.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build the engine for the browser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add wasm32-wasip1
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-wasm-${{ hashFiles('**/Cargo.toml') }}
+
+      # The CLI already takes its statements as an argument, so it needs no
+      # changes to be driven from JavaScript: argv in, stdout out.
+      #
+      # The release profile in Cargo.toml keeps debug symbols, because
+      # flamegraphs need them. Here they are nine megabytes somebody has to
+      # download before they can type a SELECT, so this build overrides the
+      # profile from the command line rather than taking them away from the
+      # profiling that wants them.
+      - name: Build lastro-cli for wasm32-wasip1
+        run: |
+          cargo build --release --target wasm32-wasip1 --bin lastro-cli             --config profile.release.debug=false             --config profile.release.strip=true             --config profile.release.lto=true             --config profile.release.codegen-units=1
+          # Around 460 KB stripped, which gzips to something a page can
+          # reasonably ask somebody to download. `wasm-opt` would shave a
+          # little more and was tried; the version in the runner's repository
+          # rejects the sign-extension opcodes rustc emits, and a step that
+          # breaks on a toolchain bump is worth less than the hundred kilobytes
+          # it saves.
+          ls -la target/wasm32-wasip1/release/lastro-cli.wasm
+
+      # The WASI shim is vendored into the site rather than pulled from a CDN at
+      # run time. A page that needs a third party to be up in order to work is a
+      # page that will be broken one day without anybody touching it.
+      - name: Vendor the WASI shim
+        run: |
+          npm install --no-save @bjorn3/browser_wasi_shim@0.4.2
+          mkdir -p site/vendor
+          cp -r node_modules/@bjorn3/browser_wasi_shim/dist/* site/vendor/
+          ls -la site/vendor
+
+      - name: Assemble the site
+        run: |
+          cp web/index.html web/app.js web/style.css site/
+          cp target/wasm32-wasip1/release/lastro-cli.wasm site/lastro.wasm
+          # The demo scripts are read at run time so they can be edited without
+          # touching JavaScript.
+          cp -r web/examples site/examples
+          ls -la site
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    name: deploy
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
