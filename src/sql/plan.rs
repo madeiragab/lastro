@@ -142,6 +142,29 @@ pub enum Plan {
         /// Where each supplied value goes in the table's column order.
         targets: Vec<usize>,
     },
+    /// Pairs every row of one side with every row of the other, keeping the
+    /// pairs the condition admits.
+    NestedLoopJoin {
+        /// The outer input.
+        left: Box<Plan>,
+        /// The inner input, walked once per outer row.
+        right: Box<Plan>,
+        /// The condition, over the two rows joined end to end.
+        on: PlanExpr,
+    },
+    /// Builds a table from one side and probes it with the other.
+    HashJoin {
+        /// The side the table is built from.
+        left: Box<Plan>,
+        /// The side that probes it.
+        right: Box<Plan>,
+        /// The key on the build side, over a joined row.
+        left_key: PlanExpr,
+        /// The key on the probe side, over a row of the right input alone.
+        right_key: PlanExpr,
+        /// Whatever the equality did not cover, over the joined row.
+        residual: Option<PlanExpr>,
+    },
     /// Changes rows in place.
     Update {
         /// The table being changed.
@@ -215,11 +238,18 @@ pub fn plan(pool: &mut BufferPool, catalog: &Catalog, statement: &ast::Statement
 }
 
 fn plan_select(pool: &mut BufferPool, catalog: &Catalog, select: &ast::Select) -> Result<Plan> {
-    if !select.joins.is_empty() {
-        return Err(Error::Unsupported("joins are not implemented yet".into()));
-    }
     let table = catalog.require(pool, &select.from.name)?;
-    let scope = Scope::single(&table, select.from.alias.as_deref());
+    let mut scope = Scope::single(&table, select.from.alias.as_deref());
+
+    // Every joined table joins the scope before anything is bound, so a
+    // condition may name a column of either side.
+    let mut joined = Vec::with_capacity(select.joins.len());
+    for join in &select.joins {
+        let right = catalog.require(pool, &join.table.name)?;
+        let boundary = scope.width();
+        scope.push(&right, join.table.alias.as_deref());
+        joined.push((right, boundary));
+    }
 
     let filter = select
         .filter
@@ -229,9 +259,11 @@ fn plan_select(pool: &mut BufferPool, catalog: &Catalog, select: &ast::Select) -
 
     // Rule 1, access selection. A predicate that pins the row id down turns the
     // scan into a descent, which is the whole reason the primary key is the key
-    // of the table's own tree.
-    let (lower, upper, residual) = match (&filter, table.rowid_column()) {
-        (Some(predicate), Some(rowid)) => split_rowid_bounds(predicate, rowid),
+    // of the table's own tree. Only for a lone table: with a join the predicate
+    // may name either side, and deciding which one it narrows is the job of a
+    // cost based planner this one is not.
+    let (lower, upper, residual) = match (&filter, table.rowid_column(), joined.is_empty()) {
+        (Some(predicate), Some(rowid), true) => split_rowid_bounds(predicate, rowid),
         _ => (None, None, filter.clone()),
     };
 
@@ -246,6 +278,30 @@ fn plan_select(pool: &mut BufferPool, catalog: &Catalog, select: &ast::Select) -
             table: table.clone(),
         }
     };
+
+    // Rule 4, join selection. An equality with one side reading only the left
+    // input and the other only the right is what a hash join needs; anything
+    // else has to be checked pair by pair.
+    for (join, (right, boundary)) in select.joins.iter().zip(joined) {
+        let on = bind_expr(&scope, &join.on)?;
+        let inner = Plan::SeqScan {
+            table: right.clone(),
+        };
+        plan = match hash_keys(&on, boundary) {
+            Some((left_key, right_key, residual)) => Plan::HashJoin {
+                left: Box::new(plan),
+                right: Box::new(inner),
+                left_key,
+                right_key: rebase(&right_key, boundary),
+                residual,
+            },
+            None => Plan::NestedLoopJoin {
+                left: Box::new(plan),
+                right: Box::new(inner),
+                on,
+            },
+        };
+    }
 
     // Rule 2, predicate pushdown. With one table the filter already sits
     // directly above the scan; the rule earns its keep once joins exist.
@@ -264,11 +320,11 @@ fn plan_select(pool: &mut BufferPool, catalog: &Catalog, select: &ast::Select) -
         .map(|item| Ok((bind_expr(&scope, &item.expr)?, item.descending)))
         .collect::<Result<_>>()?;
 
-    let already_ordered = match table.rowid_column() {
-        Some(rowid) => keys
+    let already_ordered = match (table.rowid_column(), select.joins.is_empty()) {
+        (Some(rowid), true) => keys
             .iter()
             .all(|(expr, descending)| !descending && *expr == PlanExpr::Column(rowid)),
-        None => keys.is_empty(),
+        _ => keys.is_empty(),
     };
 
     if !keys.is_empty() && !already_ordered {
@@ -336,6 +392,71 @@ fn plan_delete(pool: &mut BufferPool, catalog: &Catalog, delete: &ast::Delete) -
         lower,
         upper,
     })
+}
+
+/// Splits a join condition into the equality a hash join can use and the rest.
+///
+/// The equality qualifies only when one side reads columns from the left input
+/// alone and the other from the right alone. Anything mixed has to be evaluated
+/// on the joined row, which is what a nested loop does.
+fn hash_keys(
+    on: &PlanExpr,
+    boundary: usize,
+) -> Option<(PlanExpr, PlanExpr, Option<PlanExpr>)> {
+    let mut conjuncts = Vec::new();
+    flatten_and(on, &mut conjuncts);
+
+    let mut keys = None;
+    let mut residual = Vec::new();
+
+    for conjunct in conjuncts {
+        if keys.is_none() {
+            if let PlanExpr::Binary {
+                left,
+                op: BinaryOp::Eq,
+                right,
+            } = &conjunct
+            {
+                if let Some(pair) = sided(left, right, boundary) {
+                    keys = Some(pair);
+                    continue;
+                }
+            }
+        }
+        residual.push(conjunct);
+    }
+
+    let (left_key, right_key) = keys?;
+    let leftover = residual.into_iter().reduce(|left, right| PlanExpr::Binary {
+        left: Box::new(left),
+        op: BinaryOp::And,
+        right: Box::new(right),
+    });
+    Some((left_key, right_key, leftover))
+}
+
+/// Orders the two halves of an equality into build side and probe side, or
+/// gives up when either half straddles the boundary.
+fn sided(left: &PlanExpr, right: &PlanExpr, boundary: usize) -> Option<(PlanExpr, PlanExpr)> {
+    let side = |expr: &PlanExpr| {
+        let mut columns = Vec::new();
+        columns_of(expr, &mut columns);
+        if columns.is_empty() {
+            return None;
+        }
+        let below = columns.iter().all(|index| *index < boundary);
+        let above = columns.iter().all(|index| *index >= boundary);
+        match (below, above) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    };
+    match (side(left)?, side(right)?) {
+        (true, false) => Some((left.clone(), right.clone())),
+        (false, true) => Some((right.clone(), left.clone())),
+        _ => None,
+    }
 }
 
 /// Binds a `WHERE` clause and pulls row id bounds out of it.
@@ -451,47 +572,165 @@ fn plan_create_table(create: &ast::CreateTable) -> Result<Plan> {
 
 // -- binding ---------------------------------------------------------------
 
-/// What names mean in one statement.
-struct Scope {
-    /// The name the table goes by, lowercased.
-    qualifier: Option<String>,
-    /// Column names, lowercased, in row order.
+/// One table visible to a statement, and where its columns sit in the row.
+struct ScopeTable {
+    /// The name it goes by: its alias if it has one, its own name otherwise.
+    qualifier: String,
+    /// Column names, lowercased, in declaration order.
     columns: Vec<String>,
+    /// Where its first column sits in the joined row.
+    offset: usize,
+}
+
+/// What names mean in one statement.
+///
+/// A joined row is the inputs laid end to end, so a column is one index into
+/// that whole row. Resolving a name here is the last time a string is compared:
+/// everything below works on positions.
+struct Scope {
+    tables: Vec<ScopeTable>,
 }
 
 impl Scope {
     fn empty() -> Scope {
-        Scope {
-            qualifier: None,
-            columns: Vec::new(),
-        }
+        Scope { tables: Vec::new() }
     }
 
     fn single(table: &TableSchema, alias: Option<&str>) -> Scope {
-        Scope {
-            qualifier: Some(alias.unwrap_or(&table.name).to_ascii_lowercase()),
+        let mut scope = Scope::empty();
+        scope.push(table, alias);
+        scope
+    }
+
+    fn push(&mut self, table: &TableSchema, alias: Option<&str>) {
+        let offset = self.width();
+        self.tables.push(ScopeTable {
+            qualifier: alias.unwrap_or(&table.name).to_ascii_lowercase(),
             columns: table
                 .columns
                 .iter()
                 .map(|column| column.name.to_ascii_lowercase())
                 .collect(),
-        }
+            offset,
+        });
+    }
+
+    /// How many columns a row in this scope has.
+    fn width(&self) -> usize {
+        self.tables
+            .last()
+            .map_or(0, |table| table.offset + table.columns.len())
+    }
+
+    /// Every column, in row order.
+    fn column_names(&self) -> Vec<String> {
+        self.tables
+            .iter()
+            .flat_map(|table| table.columns.iter().cloned())
+            .collect()
     }
 
     fn resolve(&self, table: Option<&str>, name: &str) -> Result<usize> {
         if let Some(qualifier) = table {
-            let matches = self
-                .qualifier
-                .as_deref()
-                .is_some_and(|own| own.eq_ignore_ascii_case(qualifier));
-            if !matches {
-                return Err(Error::UnknownTable(qualifier.to_string()));
+            let found = self
+                .tables
+                .iter()
+                .find(|entry| entry.qualifier.eq_ignore_ascii_case(qualifier))
+                .ok_or_else(|| Error::UnknownTable(qualifier.to_string()))?;
+            return found
+                .columns
+                .iter()
+                .position(|column| column.eq_ignore_ascii_case(name))
+                .map(|index| found.offset + index)
+                .ok_or_else(|| Error::UnknownColumn(name.to_string()));
+        }
+
+        // Unqualified, so every table is a candidate. Two matches is an error
+        // rather than a coin toss: the statement is genuinely ambiguous and
+        // guessing would be worse than refusing.
+        let mut found = None;
+        for entry in &self.tables {
+            if let Some(index) = entry
+                .columns
+                .iter()
+                .position(|column| column.eq_ignore_ascii_case(name))
+            {
+                if found.is_some() {
+                    return Err(Error::AmbiguousColumn(name.to_string()));
+                }
+                found = Some(entry.offset + index);
             }
         }
-        self.columns
-            .iter()
-            .position(|column| column.eq_ignore_ascii_case(name))
-            .ok_or_else(|| Error::UnknownColumn(name.to_string()))
+        found.ok_or_else(|| Error::UnknownColumn(name.to_string()))
+    }
+}
+
+/// Every column an expression reads.
+fn columns_of(expr: &PlanExpr, out: &mut Vec<usize>) {
+    match expr {
+        PlanExpr::Const(_) => {}
+        PlanExpr::Column(index) => out.push(*index),
+        PlanExpr::Unary { operand, .. } => columns_of(operand, out),
+        PlanExpr::Binary { left, right, .. } => {
+            columns_of(left, out);
+            columns_of(right, out);
+        }
+        PlanExpr::IsNull { operand, .. } => columns_of(operand, out),
+        PlanExpr::Like { left, pattern, .. } => {
+            columns_of(left, out);
+            columns_of(pattern, out);
+        }
+        PlanExpr::Between {
+            operand, low, high, ..
+        } => {
+            columns_of(operand, out);
+            columns_of(low, out);
+            columns_of(high, out);
+        }
+    }
+}
+
+/// Shifts every column index down by `delta`.
+///
+/// The probe side of a hash join is evaluated against a row of that input
+/// alone, not against the joined row, so its key has to be rewritten to match.
+fn rebase(expr: &PlanExpr, delta: usize) -> PlanExpr {
+    match expr {
+        PlanExpr::Const(value) => PlanExpr::Const(value.clone()),
+        PlanExpr::Column(index) => PlanExpr::Column(index.saturating_sub(delta)),
+        PlanExpr::Unary { op, operand } => PlanExpr::Unary {
+            op: *op,
+            operand: Box::new(rebase(operand, delta)),
+        },
+        PlanExpr::Binary { left, op, right } => PlanExpr::Binary {
+            left: Box::new(rebase(left, delta)),
+            op: *op,
+            right: Box::new(rebase(right, delta)),
+        },
+        PlanExpr::IsNull { operand, negated } => PlanExpr::IsNull {
+            operand: Box::new(rebase(operand, delta)),
+            negated: *negated,
+        },
+        PlanExpr::Like {
+            left,
+            pattern,
+            negated,
+        } => PlanExpr::Like {
+            left: Box::new(rebase(left, delta)),
+            pattern: Box::new(rebase(pattern, delta)),
+            negated: *negated,
+        },
+        PlanExpr::Between {
+            operand,
+            low,
+            high,
+            negated,
+        } => PlanExpr::Between {
+            operand: Box::new(rebase(operand, delta)),
+            low: Box::new(rebase(low, delta)),
+            high: Box::new(rebase(high, delta)),
+            negated: *negated,
+        },
     }
 }
 
@@ -501,8 +740,8 @@ fn bind_projection(
 ) -> Result<(Vec<PlanExpr>, Vec<String>)> {
     match projection {
         ast::Projection::Star => Ok((
-            (0..scope.columns.len()).map(PlanExpr::Column).collect(),
-            scope.columns.clone(),
+            (0..scope.width()).map(PlanExpr::Column).collect(),
+            scope.column_names(),
         )),
         ast::Projection::Items(items) => {
             let mut exprs = Vec::with_capacity(items.len());
@@ -801,6 +1040,32 @@ impl Plan {
             }
             Plan::Insert { table, rows, .. } => {
                 let _ = writeln!(out, "{pad}Insert {} ({} rows)", table.name, rows.len());
+            }
+            Plan::NestedLoopJoin { left, right, on } => {
+                let _ = writeln!(out, "{pad}NestedLoopJoin {}", describe(on));
+                left.write_explain(out, depth + 1);
+                right.write_explain(out, depth + 1);
+            }
+            Plan::HashJoin {
+                left,
+                right,
+                left_key,
+                right_key,
+                residual,
+            } => {
+                let mut line = format!(
+                    "{pad}HashJoin {} = {}",
+                    describe(left_key),
+                    describe(right_key)
+                );
+                if let Some(rest) = residual {
+                    let _ = write!(line, " and {}", describe(rest));
+                }
+                let _ = writeln!(out, "{line}");
+                let _ = writeln!(out, "{pad}  build:");
+                left.write_explain(out, depth + 2);
+                let _ = writeln!(out, "{pad}  probe:");
+                right.write_explain(out, depth + 2);
             }
             Plan::Update {
                 table,
