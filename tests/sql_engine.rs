@@ -862,3 +862,96 @@ fn an_index_on_a_column_that_does_not_exist_is_refused() {
         "duplicate name"
     );
 }
+
+// -- sorting more than fits ------------------------------------------------
+
+#[test]
+fn a_sort_over_more_rows_than_fit_spills_and_still_orders() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::with_capacity(dir.path().join("sorted.lastro"), 32).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, texto TEXT)")
+        .unwrap();
+
+    // Scattered so that the order asked for is nothing like the order stored.
+    db.execute("BEGIN").unwrap();
+    for id in 1..=900i64 {
+        let n = (id * 7919) % 1000;
+        db.execute(&format!("INSERT INTO t VALUES ({id}, {n}, 'linha {id}')"))
+            .unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+
+    let in_memory = rows(&mut db, "SELECT id FROM t ORDER BY n, id");
+
+    // A budget of fifty rows over nine hundred forces eighteen runs and a
+    // merge across all of them.
+    db.set_sort_budget(50);
+    let spilled = rows(&mut db, "SELECT id FROM t ORDER BY n, id");
+
+    assert_eq!(spilled.len(), 900);
+    assert_eq!(spilled, in_memory, "spilling must not change the order");
+
+    let mut previous: Option<i64> = None;
+    for row in rows(&mut db, "SELECT n FROM t ORDER BY n") {
+        let Value::Int(n) = row[0] else { panic!() };
+        if let Some(before) = previous {
+            assert!(before <= n, "the merge came out unordered");
+        }
+        previous = Some(n);
+    }
+}
+
+#[test]
+fn a_spilled_sort_carries_every_kind_of_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::with_capacity(dir.path().join("kinds.lastro"), 32).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, r REAL, s TEXT, b BOOLEAN, n INTEGER)")
+        .unwrap();
+    db.execute("BEGIN").unwrap();
+    for id in 1..=200i64 {
+        let text = if id % 3 == 0 {
+            "NULL".to_string()
+        } else {
+            format!("'t{id}'")
+        };
+        db.execute(&format!(
+            "INSERT INTO t VALUES ({id}, {}.5, {text}, {}, {})",
+            200 - id,
+            id % 2 == 0,
+            id * 3
+        ))
+        .unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+
+    db.set_sort_budget(16);
+    let found = rows(&mut db, "SELECT id, r, s, b, n FROM t ORDER BY r");
+    assert_eq!(found.len(), 200);
+    assert_eq!(
+        found[0][0],
+        Value::Int(200),
+        "the smallest r is the last id"
+    );
+    assert_eq!(found[0][1], Value::Real(0.5));
+    assert_eq!(found[0][4], Value::Int(600));
+}
+
+#[test]
+fn a_limit_over_a_spilled_sort_stops_early() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::with_capacity(dir.path().join("top.lastro"), 32).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    db.execute("BEGIN").unwrap();
+    for id in 1..=400i64 {
+        db.execute(&format!("INSERT INTO t VALUES ({id}, {})", (id * 31) % 400))
+            .unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+
+    db.set_sort_budget(20);
+    let found = rows(&mut db, "SELECT n FROM t ORDER BY n DESC LIMIT 5");
+    assert_eq!(found.len(), 5);
+    assert_eq!(found[0][0], Value::Int(399));
+    assert_eq!(found[4][0], Value::Int(395));
+}

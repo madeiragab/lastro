@@ -29,22 +29,24 @@ number only goes in after it has been measured.
 | B+Tree transactional over the log | done |
 | Crash fuzzer | done |
 | SQL: lexer, syntax tree, parser | done |
-| SQL: catalog, binder, planner, executor | done for a single table |
-| SQL: joins, secondary indexes, UPDATE, DELETE | not started |
+| SQL: catalog, binder, planner, executor | done |
+| SQL: joins, secondary indexes, UPDATE, DELETE | done |
 | MVCC / snapshot isolation | not started |
 | Proof suite | partial: model and property tests done, crash fuzzer not |
 
 What already runs: creating and opening a `.lastro` file, allocating and freeing pages with
 freelist reuse, storing variable-length cells in slotted pages with compaction, a B+Tree index
-with splitting and merging on top of that, and a write-ahead log with full ARIES recovery — a
-committed transaction survives a crash that lost its page, and an uncommitted one is reversed
-even if its page already reached disk.
+with splitting and merging on top of that, a write-ahead log with full ARIES recovery, and a SQL
+layer with `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT` with joins, `UPDATE`, `DELETE` and
+`EXPLAIN`.
 
-The WAL rule sits in the buffer pool's eviction path: no dirty page reaches disk before the
-record describing it. It is one line of code, and it is the difference between a database and a
-file that sometimes has your data.
+A committed transaction survives a crash that lost its page, and an uncommitted one is reversed
+even if its page already reached disk. The WAL rule sits in the buffer pool's eviction path: no
+dirty page reaches disk before the record describing it. It is one line of code, and it is the
+difference between a database and a file that sometimes has your data.
 
-The library has no dependencies: CRC32C, the varint codec and the encodings are written here.
+The library has one dependency, `tempfile`, and only because an external sort has to put its
+runs somewhere. CRC32C, the varint codec and every encoding are written here.
 
 ---
 
@@ -175,6 +177,30 @@ cargo run --bin lastro-cli -- pages example.lastro
 ```bash
 cargo run --bin lastro-cli -- page example.lastro 1
 ```
+
+---
+
+### What the planner does, and what it does not
+
+Of the six rules in the specification, five are implemented and visible in `EXPLAIN`:
+
+| Rule | State |
+|---|---|
+| 1 · Access selection | ✅ row id ranges, and equality on an index's leading column |
+| 2 · Predicate pushdown | ✅ whatever the range cannot express stays as a filter |
+| 3 · Projection pushdown | not applicable |
+| 4 · Join selection | ✅ hash when the equality separates the sides, nested loop otherwise |
+| 5 · Sort elimination | ✅ when the order asked for is the primary key ascending |
+| 6 · Limit pushdown | ✅ `LIMIT` over `Sort` becomes a top-N, counting the `OFFSET` |
+
+Rule 3 is not "not done", it is **without effect in this representation**: a row is the table's
+whole tuple, decoded by the scan. There is nothing a projection above can do to make the scan
+read less, short of a columnar layout or a covering index. Recorded that way rather than listed
+as outstanding.
+
+Ranges over a secondary index — `WHERE weight > 400` with an index on `weight` — are also left
+out, for a specific reason: getting the edges of a range over a composite key right is exactly
+the kind of detail that goes wrong in silence. Equality is correct and checkable; ranges wait.
 
 ---
 
