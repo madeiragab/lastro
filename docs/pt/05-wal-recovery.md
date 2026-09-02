@@ -275,6 +275,25 @@ flowchart TD
     NEXT --> S
 ```
 
+### Por que perda de energia, e não `SIGKILL`
+
+Matar o processo é o jeito óbvio de simular uma queda, e não testa o que precisa ser testado. Um
+processo morto perde os próprios buffers, mas toda escrita que já chegou ao sistema operacional
+continua no cache de páginas, e o núcleo a grava depois de qualquer jeito. O dado sobrevive, a
+regra WAL nunca é pressionada, e o teste passa exista a regra ou não.
+
+Perda de energia é outra coisa: **só o que passou por `fsync` sobrevive.** É essa a condição que
+o write-ahead log inteiro existe para tratar, então é essa que está modelada. As escritas ficam
+retidas até um sync torná-las duráveis, e a queda descarta o que não chegou lá.
+
+A energia cai no n-ésimo ponto de sincronização, e nesse ponto só um prefixo do que estava
+pendente aterrissa — o que também produz a cauda truncada de log que os checksums por registro
+existem para pegar.
+
+**O que não está modelado:** escrita de página rasgada no meio. Páginas de dados não têm
+checksum, então meia página seria indetectável. A solução usual é gravar imagem de página inteira
+depois de cada checkpoint, e isso está registrado como trabalho futuro em vez de omitido.
+
 **Por que `SIGKILL` e não uma exceção:** `SIGKILL` não pode ser capturado. Nenhum destrutor roda,
 nenhum buffer é esvaziado, nenhum `Drop` acontece. É a simulação mais fiel de queda de energia
 que dá para fazer sem hardware.
