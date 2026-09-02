@@ -2,7 +2,7 @@
 name = "lastro"
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.82"
 description = "An embedded relational database written from scratch: pager, B+Tree, WAL with crash recovery, SQL parser and MVCC."
 license = "MIT"
 repository = "https://github.com/madeiragab/lastro"
