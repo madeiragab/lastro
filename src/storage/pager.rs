@@ -486,8 +486,9 @@ fn get_u64(bytes: &[u8], offset: usize) -> u64 {
 
 // -- positional I/O --------------------------------------------------------
 //
-// `pread`/`pwrite` on Unix, `seek_read`/`seek_write` on Windows. Both take the
-// offset as an argument, so the pager never owns a file cursor.
+// `pread`/`pwrite` on Unix, `seek_read`/`seek_write` on Windows, and the same
+// pair again under WASI, which is how the engine runs in a browser. All of them
+// take the offset as an argument, so the pager never owns a file cursor.
 
 #[cfg(unix)]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
@@ -498,6 +499,18 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 #[cfg(unix)]
 fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
+    file.write_all_at(buf, offset)
+}
+
+#[cfg(target_os = "wasi")]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::os::wasi::fs::FileExt;
+    file.read_exact_at(buf, offset)
+}
+
+#[cfg(target_os = "wasi")]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    use std::os::wasi::fs::FileExt;
     file.write_all_at(buf, offset)
 }
 
