@@ -139,6 +139,16 @@ impl Parser {
                 self.advance();
                 Ok(Statement::Rollback)
             }
+            TokenKind::Word(Keyword::Vacuum) => {
+                self.advance();
+                match self.peek().clone() {
+                    TokenKind::Ident(name) => {
+                        self.advance();
+                        Ok(Statement::Vacuum(Some(name)))
+                    }
+                    _ => Ok(Statement::Vacuum(None)),
+                }
+            }
             TokenKind::Word(Keyword::Explain) => {
                 self.advance();
                 Ok(Statement::Explain(Box::new(self.statement()?)))
