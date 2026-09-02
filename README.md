@@ -17,6 +17,31 @@ linha por linha, o que um banco de dados faz entre o seu `INSERT` e o dado estar
 
 ---
 
+## Como este projeto foi escrito
+
+Escrito com assistência de IA, em sessões longas, com revisão minha camada por camada. O
+histórico do repositório não esconde: os commits saem rápido e carregam `Co-Authored-By`.
+
+Vale dizer o que a assistência **não** decidiu, porque é o que sobra quando se tira a
+digitação. A especificação — formato binário, formato do registro de log, as invariantes de
+cada estrutura — veio antes do código e está em [`docs/`](docs/pt/). O critério de pronto de
+cada camada é o teste que ela tem que passar, não a funcionalidade que ela expõe. Modelar o
+corte de energia em vez de matar o processo foi uma decisão sobre o que o teste precisa
+provar, e é a diferença entre o crash fuzzer valer alguma coisa ou nada. Cada número nas
+tabelas foi medido, com o comando ao lado.
+
+Se a pergunta é quanto disto eu entendo de fato, a resposta mais honesta que eu tenho é o
+[Diário de bugs](POSTMORTEM.md): cinco erros, o sintoma de cada um, por que os testes que
+existiam deixaram passar e o que ficou. Depuração não terceiriza.
+
+O quarto daquele diário nem era meu: o buffer de argumentos que estourava a partir do primeiro
+caractere acentuado é do shim WASI que a demo usa, e o sintoma apontava para o meu parser. Achar,
+isolar e mandar a correção para o upstream —
+[bjorn3/browser_wasi_shim#113](https://github.com/bjorn3/browser_wasi_shim/pull/113) — é o que
+sobra depois que a digitação sai de cena.
+
+---
+
 ## Status
 
 Em construção. Nada aqui é estável. Todo número nas tabelas de resultado foi medido, com o
