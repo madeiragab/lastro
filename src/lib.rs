@@ -5,8 +5,9 @@
 //! - [`storage::pager`] — reads and writes fixed-size pages, owns the freelist
 //! - [`storage::buffer`] — a bounded cache of pages with a clock replacement policy
 //! - [`storage::page`] — the slotted page layout and the on-disk encodings
+//! - [`index::btree`] — an ordered map of bytes to bytes, over those pages
 //!
-//! Everything above (B+Tree, WAL, SQL, MVCC) is specified in `docs/` and not yet
+//! Everything above (WAL, SQL, MVCC) is specified in `docs/` and not yet
 //! implemented. The specification is the contract; see `docs/en/02-file-format.md`
 //! for the binary layouts these modules implement.
 //!
@@ -27,8 +28,33 @@
 //!
 //! pool.flush_all().unwrap();
 //! ```
+//!
+//! And the ordered map on top of it:
+//!
+//! ```
+//! use lastro::index::BTree;
+//! use lastro::storage::{BufferPool, Pager};
+//!
+//! let dir = tempfile::tempdir().unwrap();
+//! let pager = Pager::create(dir.path().join("cattle.lastro")).unwrap();
+//! let mut pool = BufferPool::new(pager, 64);
+//!
+//! let mut tree = BTree::create(&mut pool).unwrap();
+//! for id in 0u32..5_000 {
+//!     tree.insert(&mut pool, &id.to_be_bytes(), b"BR-0042").unwrap();
+//! }
+//!
+//! // A range scan descends once and then follows leaf siblings.
+//! let window = tree
+//!     .range(&mut pool, Some(&100u32.to_be_bytes()), Some(&200u32.to_be_bytes()))
+//!     .unwrap();
+//! assert_eq!(window.len(), 100);
+//!
+//! tree.check_tree(&mut pool).unwrap();
+//! ```
 
 pub mod error;
+pub mod index;
 pub mod storage;
 pub mod util;
 
