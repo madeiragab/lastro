@@ -1,3 +1,8 @@
+# The benchmark against SQLite lives in its own crate, so that compiling or
+# testing lastro never pulls SQLite in. `cargo test` here stays on this package.
+[workspace]
+members = ["bench"]
+
 [package]
 name = "lastro"
 version = "0.0.1"
