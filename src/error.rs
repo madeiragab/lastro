@@ -74,6 +74,9 @@ pub enum Error {
     /// A statement names a column that does not exist.
     UnknownColumn(String),
 
+    /// A column name means more than one thing in this statement.
+    AmbiguousColumn(String),
+
     /// A statement asks for something this build does not do yet.
     Unsupported(String),
 
@@ -144,6 +147,9 @@ impl fmt::Display for Error {
             Error::InvalidKey(why) => write!(f, "invalid key: {why}"),
             Error::UnknownTable(name) => write!(f, "there is no table called {name}"),
             Error::UnknownColumn(name) => write!(f, "there is no column called {name}"),
+            Error::AmbiguousColumn(name) => {
+                write!(f, "{name} names a column in more than one table here")
+            }
             Error::Unsupported(what) => write!(f, "not supported: {what}"),
             Error::TableExists(name) => write!(f, "a table called {name} already exists"),
             Error::NotNull(column) => write!(f, "{column} does not accept NULL"),
