@@ -27,7 +27,17 @@ pub const SLOT_SIZE: usize = 4;
 /// The largest payload that may be stored inline in a cell. Anything larger
 /// belongs in an overflow chain. The limit is a quarter of a page, which
 /// guarantees a minimum fanout of four in interior nodes.
+///
+/// This is a policy constant for the index layer, not something the page
+/// enforces: a page only refuses a cell that cannot physically fit.
 pub const MAX_INLINE_CELL: usize = PAGE_SIZE / 4;
+
+/// Bytes a page can devote to slots and cells together.
+pub const USABLE_SPACE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
+
+/// The largest cell that can physically be stored, which is one occupying an
+/// otherwise empty page.
+pub const MAX_CELL: usize = USABLE_SPACE - SLOT_SIZE;
 
 const OFF_TYPE: usize = 0;
 const OFF_FLAGS: usize = 1;
@@ -207,6 +217,20 @@ impl Page {
         self.free_space() + self.fragmented() as usize
     }
 
+    /// Bytes actually occupied by slots and live cells.
+    pub fn used_space(&self) -> usize {
+        USABLE_SPACE - self.total_free()
+    }
+
+    /// How full the page is, in percent of [`USABLE_SPACE`].
+    ///
+    /// The B+Tree uses this to decide when a node has underflowed. Integer
+    /// arithmetic on purpose: a threshold that depends on float rounding is a
+    /// threshold that behaves differently on different machines.
+    pub fn occupancy_percent(&self) -> usize {
+        self.used_space() * 100 / USABLE_SPACE
+    }
+
     // -- cells -------------------------------------------------------------
 
     /// The bytes of a live cell, or `None` if the slot is dead or absent.
@@ -234,7 +258,7 @@ impl Page {
     /// Compacts first if the contiguous free space is short but the page holds
     /// enough reclaimable bytes overall.
     pub fn insert_cell_at(&mut self, index: u16, bytes: &[u8]) -> Result<()> {
-        if bytes.len() > MAX_INLINE_CELL {
+        if bytes.len() > MAX_CELL {
             return Err(Error::CellTooLarge(bytes.len()));
         }
         let count = self.slot_count();
@@ -565,16 +589,30 @@ mod tests {
     fn rejects_oversized_and_overfull() {
         let mut page = leaf();
         assert!(matches!(
-            page.push_cell(&vec![0u8; MAX_INLINE_CELL + 1]),
+            page.push_cell(&vec![0u8; MAX_CELL + 1]),
             Err(Error::CellTooLarge(_))
         ));
 
-        while page.push_cell(&[0u8; MAX_INLINE_CELL]).is_ok() {}
-        assert!(matches!(
-            page.push_cell(&[0u8; MAX_INLINE_CELL]),
-            Err(Error::PageFull)
-        ));
+        // A cell that exactly fills an empty page is accepted, and nothing
+        // fits beside it.
+        page.push_cell(&vec![0u8; MAX_CELL]).unwrap();
+        assert_eq!(page.free_space(), 0);
+        assert!(matches!(page.push_cell(b"x"), Err(Error::PageFull)));
         page.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn occupancy_tracks_used_space() {
+        let mut page = leaf();
+        assert_eq!(page.used_space(), 0);
+        assert_eq!(page.occupancy_percent(), 0);
+
+        page.push_cell(&[0u8; 1000]).unwrap();
+        assert_eq!(page.used_space(), 1004);
+        assert_eq!(page.occupancy_percent(), 1004 * 100 / USABLE_SPACE);
+
+        page.delete_cell(0).unwrap();
+        assert_eq!(page.used_space(), 4, "the dead slot still costs its slot");
     }
 
     #[test]
