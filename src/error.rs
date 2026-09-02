@@ -55,6 +55,9 @@ pub enum Error {
     /// Page 0 holds the database metadata and can never be freed.
     CannotFreeMetaPage,
 
+    /// A logged write was asked for on a pool with no log attached.
+    NoLogAttached,
+
     /// A key could not be encoded; currently only `NaN`.
     InvalidKey(&'static str),
 }
@@ -89,6 +92,7 @@ impl fmt::Display for Error {
             }
             Error::PageStillPinned(p) => write!(f, "page {p} is still pinned elsewhere"),
             Error::CannotFreeMetaPage => write!(f, "the metadata page cannot be freed"),
+            Error::NoLogAttached => write!(f, "no write-ahead log is attached to this pool"),
             Error::InvalidKey(why) => write!(f, "invalid key: {why}"),
         }
     }

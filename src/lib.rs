@@ -6,8 +6,9 @@
 //! - [`storage::buffer`] — a bounded cache of pages with a clock replacement policy
 //! - [`storage::page`] — the slotted page layout and the on-disk encodings
 //! - [`index::btree`] — an ordered map of bytes to bytes, over those pages
+//! - [`wal`] — the write-ahead log and ARIES recovery
 //!
-//! Everything above (WAL, SQL, MVCC) is specified in `docs/` and not yet
+//! Everything above (SQL, MVCC) is specified in `docs/` and not yet
 //! implemented. The specification is the contract; see `docs/en/02-file-format.md`
 //! for the binary layouts these modules implement.
 //!
@@ -57,6 +58,7 @@ pub mod error;
 pub mod index;
 pub mod storage;
 pub mod util;
+pub mod wal;
 
 pub use error::{Error, Result};
 
