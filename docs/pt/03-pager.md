@@ -152,6 +152,12 @@ impl Drop for PageGuard<'_> {
 É um dos lugares onde a escolha de Rust paga: o vazamento de pin, que em C seria um bug de
 disciplina, vira estruturalmente impossível.
 
+**Estado da implementação.** O `PageGuard` com `Drop` exige interior mutability no pool, e isso
+chega junto com o WAL. Até lá o pin é um token `PinnedPage` que precisa ser devolvido ao
+`unpin`. O token não é `Copy` nem `Clone`, então não dá para duplicá-lo sem querer, e
+`BufferPool::check_invariants` falha se sobrar qualquer pin ao fim de uma operação — o
+vazamento aparece na operação que o causou, que é o que importa.
+
 ---
 
 ## Invariantes
