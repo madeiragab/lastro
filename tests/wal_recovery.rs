@@ -16,8 +16,11 @@ use lastro::{Lsn, PageId, TxId, PAGE_SIZE};
 /// Opens the database and its log, running recovery the way a real open would.
 fn open(path: &Path, capacity: usize) -> (BufferPool, lastro::wal::RecoveryReport) {
     let pager = Pager::open_or_create(path).unwrap();
+    // The log's numbering continues across checkpoints, and where it continues
+    // from lives in the metadata page.
+    let base = pager.meta().last_checkpoint_lsn;
     let mut pool = BufferPool::new(pager, capacity);
-    pool.attach_wal(Wal::open(Wal::path_for(path)).unwrap());
+    pool.attach_wal(Wal::open(Wal::path_for(path), base).unwrap());
     let report = recover(&mut pool).unwrap();
     (pool, report)
 }
