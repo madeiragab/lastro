@@ -5,7 +5,7 @@
 //! catches whole classes of precedence and associativity mistakes that nobody
 //! would think to write a case for.
 
-use lastro::sql::{parse, parse_many, Expr, Literal, Projection, Statement};
+use lastro::sql::{parse, parse_many, DataType, Expr, Literal, Projection, Statement};
 use lastro::Error;
 use proptest::prelude::*;
 
@@ -162,7 +162,7 @@ fn errors_point_at_the_offending_token() {
         ("SELECT a FROM", 13),
         ("SELECT a FROM t WHERE", 21),
         ("INSERT INTO t VALUES", 20),
-        ("CREATE TABLE t (a NOTATYPE)", 18),
+        ("CREATE TABLE t (a 42)", 18),
         ("SELECT a FROM t LIMIT -1", 22),
     ];
     for (sql, at) in cases {
@@ -250,4 +250,20 @@ fn distinct_survives_a_round_trip() {
     // `ALL` is the default, so it is not written back out.
     let all = lastro::sql::parse("SELECT ALL a FROM t").unwrap();
     assert_eq!(all.to_string(), "SELECT a FROM t");
+}
+
+#[test]
+fn an_unknown_type_name_is_read_rather_than_refused() {
+    // Deliberate, and the reason `CREATE TABLE t (a NOTATYPE)` is no longer in
+    // the list of statements that must fail. lastro follows SQLite's affinity
+    // rules: what a type name contains decides what it means, and a name that
+    // matches nothing falls to the last rule instead of being rejected. A
+    // schema written for another database is a schema this one accepts.
+    let statement = parse("CREATE TABLE t (a NOTATYPE, b VARCHAR(8), c FLOAT)").unwrap();
+    let Statement::CreateTable(create) = statement else {
+        panic!("not a CREATE TABLE")
+    };
+    assert_eq!(create.columns[0].data_type, DataType::Real);
+    assert_eq!(create.columns[1].data_type, DataType::Text);
+    assert_eq!(create.columns[2].data_type, DataType::Real);
 }
