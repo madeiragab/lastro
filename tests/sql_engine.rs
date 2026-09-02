@@ -1159,7 +1159,11 @@ fn a_vacuum_leaves_what_is_still_readable() {
     db.query("DELETE FROM t WHERE id = 3").unwrap();
 
     let report = db.query("VACUUM t").unwrap();
-    assert_eq!(report, Outcome::Affected(3), "two superseded and one removed");
+    assert_eq!(
+        report,
+        Outcome::Affected(3),
+        "two superseded and one removed"
+    );
 
     let found = rows(&mut db, "SELECT id, n FROM t");
     assert_eq!(found.len(), 2);
@@ -1202,17 +1206,26 @@ fn a_vacuum_clears_the_index_entries_that_point_at_nothing() {
     // Moving every row to one value leaves the old entries behind.
     db.query("UPDATE t SET cor = 'novo'").unwrap();
     assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'c1'").len(), 0);
-    assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'novo'").len(), 100);
+    assert_eq!(
+        rows(&mut db, "SELECT id FROM t WHERE cor = 'novo'").len(),
+        100
+    );
 
     let report = db.query("VACUUM t").unwrap();
     let Outcome::Affected(removed) = report else {
         panic!()
     };
-    assert!(removed >= 200, "a hundred versions and a hundred entries: {removed}");
+    assert!(
+        removed >= 200,
+        "a hundred versions and a hundred entries: {removed}"
+    );
 
     // And the answers are the same afterwards.
     assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'c1'").len(), 0);
-    assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'novo'").len(), 100);
+    assert_eq!(
+        rows(&mut db, "SELECT id FROM t WHERE cor = 'novo'").len(),
+        100
+    );
 }
 
 #[test]

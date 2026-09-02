@@ -32,9 +32,10 @@ number only goes in after it has been measured.
 | SQL: catalog, binder, planner, executor | done |
 | SQL: joins, secondary indexes, UPDATE, DELETE | done |
 | MVCC: row versions, snapshots, the visibility rule | done |
-| MVCC: dead version collection | not started |
+| MVCC: dead version collection (`VACUUM`) | done |
 | Proof: model, property, crash fuzzer | done |
-| Proof: sqllogictest, anomaly battery, benchmark | not started |
+| Proof: anomaly battery | done |
+| Proof: sqllogictest, benchmark against SQLite | not started |
 
 What already runs: creating and opening a `.lastro` file, allocating and freeing pages with
 freelist reuse, storing variable-length cells in slotted pages with compaction, a B+Tree index
@@ -242,18 +243,37 @@ SQL subset implemented here.
 | Tests run | pending |
 | Passed | pending |
 
-**Transactional correctness** — the classic isolation anomalies. The goal is not to pass them
-all: snapshot isolation permits *write skew* by definition. The table shows what is prevented
-and what is not, because a database that lies about its own isolation level is worse than a slow
-one.
+**Transactional correctness** — the classic isolation anomalies, measured at two levels because
+they answer different questions.
 
-| Anomaly | Prevented? |
+What the **visibility rule** alone prevents, exercised with the version histories each anomaly
+would produce:
+
+| Anomaly | Prevented by the rule? |
 |---|---|
-| Dirty read | pending |
-| Non-repeatable read | pending |
-| Phantom read | pending |
-| Lost update | pending |
-| Write skew | pending |
+| Dirty read | ✅ |
+| Non-repeatable read | ✅ |
+| Phantom read | ✅ |
+| Write skew | ❌ |
+
+The `❌` is expected. Snapshot isolation permits write skew by definition, and there is a test
+that **asserts the anomaly** rather than hiding it. If the isolation is ever hardened, that test
+fails — and the failure is the correct signal that the documentation has to change with it.
+
+What the **engine** prevents, which is a different thing:
+
+| Anomaly | Prevented by the engine? | By what |
+|---|---|---|
+| Dirty read | ✅ | the visibility rule |
+| Non-repeatable read | ✅ | the snapshot held since `BEGIN` |
+| Phantom read | ✅ | the same snapshot |
+| Lost update | ✅ | one writer at a time |
+| Write skew | ✅ | one writer at a time |
+
+**The last two lines are not the isolation level's doing.** They follow from the engine refusing
+a second writer: the two-transaction schedule cannot even be built. A battery that only ran the
+engine would report "prevented" for all five, and would be reporting the concurrency model while
+appearing to report the isolation level. That distinction is why the battery has two levels.
 
 **Performance** — compared against SQLite on identical workloads. Expectation: `lastro` loses by
 a wide margin. SQLite has 25 years of optimization. The charts will be published showing the
