@@ -23,7 +23,7 @@ number only goes in after it has been measured.
 | File format, slotted page, encodings | done |
 | Pager and freelist | done |
 | Buffer pool with clock policy | done |
-| B+Tree | not started |
+| B+Tree | done |
 | WAL + crash recovery | not started |
 | SQL (parser, planner, executor) | not started |
 | MVCC / snapshot isolation | not started |
@@ -182,7 +182,42 @@ that shows who won, it is the one that explains why.
 A record of the mistakes that cost real time, because that is the part that actually taught
 something.
 
-*(To be filled in. The first one will probably be page corruption.)*
+### The invariant that was wrong twice
+
+The specification asserted that every B+Tree node outside the root would be at least 40% full.
+That is what every textbook says, and here it is false.
+
+**First attempt.** I wrote the 40% threshold, and it does not survive variable-length cells: a
+single cell can occupy a third of a page, so a perfectly even split leaves both halves under the
+floor with nothing wrong.
+
+**Second attempt.** I replaced it with something stronger and apparently bulletproof: *no two
+adjacent siblings fit into a single page together* — that is, nothing that could have been merged
+was left unmerged. I wrote the check, ran the property test, and it failed.
+
+The minimal case proptest shrank to **contained no deletes at all.** Only inserts.
+
+The reason, obvious afterwards: when a full node splits down the middle, each half holds about
+half a page. One of them now sits beside an untouched neighbour — a neighbour it never had to fit
+alongside, because before the split it was part of one large node. Splitting creates mergeable
+pairs. It is not a delete bug, it is what insertion does.
+
+**What stands now.** The fill factor is not asserted, it is **measured**, by `BTree::stats`, and
+the tests assert on the measurement. Invariant 4 became something modest and true: no node
+outside the root is empty.
+
+The lesson is not about B+Trees. It is that an invariant written from what the textbook says,
+without being run against random input, is a hypothesis — and the first two hypotheses here were
+wrong for different reasons.
+
+### The right sibling that was never looked at
+
+Found by the same test, before the one above. Rebalancing after a delete only tried to merge the
+node with its **left** sibling. A node that could have merged rightward just sat there.
+
+Nothing visibly breaks when that happens. Every query still returns the right answer; the tree
+merely drifts sparser than it should, forever. It is the kind of defect a behavioural test never
+catches, and the reason the invariant check exists.
 
 ---
 

@@ -23,7 +23,7 @@ número só entra depois de medido.
 | Formato de arquivo, slotted page, codificações | concluído |
 | Pager e freelist | concluído |
 | Buffer pool com política clock | concluído |
-| B+Tree | não começado |
+| B+Tree | concluído |
 | WAL + crash recovery | não começado |
 | SQL (parser, planner, executor) | não começado |
 | MVCC / snapshot isolation | não começado |
@@ -177,7 +177,42 @@ o que explica por quê.
 
 Registro dos erros que custaram caro, porque é a parte que de fato ensinou alguma coisa.
 
-*(A preencher. O primeiro provavelmente será corrupção de página.)*
+### A invariante que estava errada duas vezes
+
+A especificação afirmava que todo nó da B+Tree fora da raiz estaria pelo menos 40% cheio. É o
+que todo livro diz, e é falso aqui.
+
+**Primeira tentativa.** Escrevi o limiar de 40%, e ele não sobrevive a células de tamanho
+variável: uma única célula pode ocupar um terço da página, então uma divisão perfeitamente
+equilibrada deixa as duas metades abaixo do piso sem nada estar errado.
+
+**Segunda tentativa.** Troquei por algo mais forte e aparentemente à prova de bala: *nenhum par
+de irmãos adjacentes cabe junto em uma única página* — ou seja, nada que poderia ter sido fundido
+ficou sem fundir. Escrevi a verificação, rodei o teste de propriedade, e ela falhou.
+
+O caso mínimo que o proptest reduziu **não tinha nenhuma remoção.** Só inserções.
+
+O motivo, óbvio depois: quando um nó cheio racha ao meio, cada metade fica com meia página. Uma
+delas agora está ao lado de um vizinho intocado — um vizinho ao qual ela nunca precisou caber
+junto, porque antes do split ela fazia parte de um nó grande. Split cria pares fundíveis. Não é
+bug de remoção, é a natureza da inserção.
+
+**O que ficou.** O fator de preenchimento não é afirmado, é **medido**, por `BTree::stats`, e os
+testes afirmam sobre a medida. A invariante 4 virou algo modesto e verdadeiro: nenhum nó fora da
+raiz está vazio.
+
+A lição não é sobre B+Tree. É que uma invariante escrita a partir do que o livro diz, sem ser
+executada contra entrada aleatória, é uma hipótese — e as duas primeiras hipóteses aqui estavam
+erradas por motivos diferentes.
+
+### O irmão da direita que nunca era olhado
+
+Achado pelo mesmo teste, antes do anterior. O rebalanceamento após uma remoção só tentava fundir
+o nó com o irmão da **esquerda**. Um nó que poderia ter fundido para a direita ficava parado.
+
+Nada quebra de forma visível quando isso acontece. Toda consulta continua devolvendo a resposta
+certa; a árvore só vai ficando mais esparsa do que deveria, para sempre. É o tipo de defeito que
+teste de comportamento nunca pega, e a razão de a verificação de invariante existir.
 
 ---
 
