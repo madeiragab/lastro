@@ -75,9 +75,20 @@ jobs:
           cp -r node_modules/@bjorn3/browser_wasi_shim/dist/* site/vendor/
           ls -la site/vendor
 
+      # Every asset URL carries the commit it was built from. Without this a
+      # visitor who has been here before keeps the WebAssembly their browser
+      # cached and runs an old engine against new JavaScript, which fails in
+      # ways that look like engine bugs and are not.
       - name: Assemble the site
         run: |
           cp web/index.html web/app.js web/style.css site/
+          stamp="${GITHUB_SHA:0:12}"
+          sed -i "s|\./lastro\.wasm|./lastro.wasm?v=$stamp|g" site/app.js
+          sed -i "s|\${id}\.sql|\${id}.sql?v=$stamp|g" site/app.js
+          sed -i "s|\./style\.css|./style.css?v=$stamp|g" site/index.html
+          sed -i "s|\./app\.js|./app.js?v=$stamp|g" site/index.html
+          echo "carimbo: $stamp"
+          grep -o "lastro.wasm?v=[a-f0-9]*" site/app.js
           cp target/wasm32-wasip1/release/lastro-cli.wasm site/lastro.wasm
           # The demo scripts are read at run time so they can be edited without
           # touching JavaScript.
