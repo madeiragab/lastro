@@ -17,6 +17,31 @@ line, what a database does between your `INSERT` and the data being safe on disk
 
 ---
 
+## How this project was written
+
+Written with AI assistance, in long sessions, reviewed by me layer by layer. The repository
+history does not hide it: commits come out fast and carry `Co-Authored-By`.
+
+Worth saying what the assistance did **not** decide, because that is what remains once the
+typing is taken out. The specification — binary file format, log record format, the invariants
+of each structure — came before the code and lives in [`docs/`](docs/en/). Each layer's
+definition of done is the test it has to pass, not the feature it exposes. Modelling power
+loss rather than killing the process was a decision about what the test needs to prove, and it
+is the difference between the crash fuzzer being worth something and being worth nothing.
+Every number in the tables was measured, with the command beside it.
+
+If the question is how much of this I actually understand, the most honest answer I have is
+the [Bug diary](POSTMORTEM.en.md): five defects, the symptom of each, why the tests that
+existed let them through, and what stayed. Debugging does not outsource.
+
+The fourth one in that diary was not even mine: the argument buffer that overran from the first
+accented character belongs to the WASI shim the demo runs on, and the symptom pointed straight at
+my parser. Finding it, isolating it and sending the fix upstream —
+[bjorn3/browser_wasi_shim#113](https://github.com/bjorn3/browser_wasi_shim/pull/113) — is what is
+left once the typing is taken out.
+
+---
+
 ## Status
 
 Under construction. Nothing here is stable. Every number in the result tables was measured,
