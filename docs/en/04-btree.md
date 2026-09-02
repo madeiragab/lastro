@@ -135,21 +135,25 @@ Deleting is always harder than inserting.
 
 ```
 delete(key):
-    locate the leaf
-    mark the slot dead, update `fragmented`
-    if leaf occupancy >= 40%: done
-
-    if a sibling can lend without dropping below 40%:
-        redistribute, update the separator in the parent
-    else:
-        merge with the sibling, remove the separator from the parent
-        if the parent drops below 40%: repeat one level up
-        if the root ends up with a single child: the tree loses a level
+    locate the leaf, remove the entry
+    walk back up the descent path, and at every level:
+        if the node and its left sibling fit together: merge
+        else if the node and its right sibling fit together: merge
+        else: stop, because nothing above changed
+    if the root ends up with a single child: the tree loses a level
 ```
 
-The 40% threshold instead of 50% creates hysteresis. At exactly 50%, an alternating
-insert/delete sequence at the boundary makes the tree split and merge on every operation, burning
-I/O for nothing. The dead band between 40% and 50% kills that oscillation.
+**Both neighbours have to be tried.** Looking only leftward leaves a node that could have merged
+rightward sitting there. Nothing visibly breaks when that happens — the tree stays correct, it
+just drifts sparse — which is exactly why an invariant check exists instead of trusting
+behavioural tests.
+
+**There is no redistribution.** The specification called for borrowing from a sibling when a
+merge would not fit, to hold up the fill floor. In practice redistribution has a problem of its
+own: balancing children *k-1* and *k* can shrink *k-1* enough that *k-2* and *k-1* now fit
+together, leaving a mergeable pair behind. Fixing that cascades with no natural stopping point.
+Merging alone is simple and checkable, and what is given up in exchange is measured in the
+section below.
 
 ### Contingency plan
 
@@ -190,11 +194,30 @@ Checked by a `check_tree()` called at the end of every test:
 1. Every leaf is at the same depth. The tree is perfectly height-balanced.
 2. Keys within each page are in strictly increasing order.
 3. All keys in a child respect the range defined by the parent's separators.
-4. Every node except the root has at least 40% occupancy.
+4. No node outside the root is empty.
 5. Following sibling pointers from the leftmost leaf visits every key exactly once, in
    ascending order.
 6. No page is reachable by two distinct paths from the root.
 7. The key count reachable through the tree equals the count obtained by range scan.
+
+### What happened to "at least 40% full"
+
+The specification asserted a per-node fill floor. **Two wordings were tried in
+the implementation and neither survived the property tests:**
+
+- *"every node is at least 40% full"* fails because a single cell can occupy a
+  third of a page. An even split can leave both halves under the floor with
+  nothing actually wrong.
+- *"no two adjacent siblings fit in one page together"* fails on **insert**, not
+  delete. When a full node splits, each half holds about half a page, and one of
+  them may now fit alongside the untouched neighbour beside it — a neighbour it
+  never had to fit beside before. The minimal case proptest found contains no
+  deletes at all.
+
+So the fill factor is **not asserted here, it is measured**, by `BTree::stats`,
+and the tests assert on the measurement. A bound that only holds for fixed-size
+records is not a bound, and a number checked on every run is worth more than a
+guarantee that quietly does not apply.
 
 Invariant 5 is the most valuable of the seven. It cross-checks two independent structures — the
 hierarchy and the linked list — and therefore catches nearly every split or merge bug the others
