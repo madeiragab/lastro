@@ -1,0 +1,813 @@
+//! Binding names to positions, and choosing how to run a statement.
+//!
+//! The binder resolves every table and column against the catalog, so that from
+//! here down nothing compares strings on the hot path — a column is an index
+//! into a row. The planner then applies fixed rules, in order, to turn the bound
+//! statement into a tree of operators.
+//!
+//! Rule based rather than cost based, on purpose: the goal of this project is
+//! storage and durability, not query optimization, and fixed rules give
+//! reasonable plans for a fraction of the effort. See `docs/en/adr.md`, ADR-007.
+
+use std::fmt::Write as _;
+
+use crate::sql::ast;
+use crate::sql::ast::{BinaryOp, DataType, UnaryOp};
+use crate::sql::catalog::{Catalog, ColumnSchema, TableSchema};
+use crate::storage::page::encoding::Value;
+use crate::storage::BufferPool;
+use crate::{Error, Result};
+
+/// An expression with every name already resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanExpr {
+    /// A value fixed when the statement was written.
+    Const(Value),
+    /// A column, by position in the row.
+    Column(usize),
+    /// A prefix operator.
+    Unary {
+        /// Which operator.
+        op: UnaryOp,
+        /// What it applies to.
+        operand: Box<PlanExpr>,
+    },
+    /// An infix operator.
+    Binary {
+        /// The left operand.
+        left: Box<PlanExpr>,
+        /// Which operator.
+        op: BinaryOp,
+        /// The right operand.
+        right: Box<PlanExpr>,
+    },
+    /// `IS NULL`, negated or not.
+    IsNull {
+        /// What is being tested.
+        operand: Box<PlanExpr>,
+        /// Whether `NOT` was written.
+        negated: bool,
+    },
+    /// `LIKE`, negated or not.
+    Like {
+        /// What is being matched.
+        left: Box<PlanExpr>,
+        /// The pattern.
+        pattern: Box<PlanExpr>,
+        /// Whether `NOT` was written.
+        negated: bool,
+    },
+    /// `BETWEEN`, negated or not.
+    Between {
+        /// What is being tested.
+        operand: Box<PlanExpr>,
+        /// The lower bound, inclusive.
+        low: Box<PlanExpr>,
+        /// The upper bound, inclusive.
+        high: Box<PlanExpr>,
+        /// Whether `NOT` was written.
+        negated: bool,
+    },
+}
+
+/// One end of a row id range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bound {
+    /// The row id at the edge.
+    pub value: i64,
+    /// Whether the edge itself is included.
+    pub inclusive: bool,
+}
+
+/// A node of the plan.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Plan {
+    /// Walks every row of a table in row id order.
+    SeqScan {
+        /// The table being read.
+        table: TableSchema,
+    },
+    /// Walks the part of a table a row id range covers.
+    ///
+    /// Only possible on a table whose primary key is the row id; see
+    /// [`TableSchema::rowid_column`].
+    RowIdScan {
+        /// The table being read.
+        table: TableSchema,
+        /// The lower edge of the range.
+        lower: Option<Bound>,
+        /// The upper edge of the range.
+        upper: Option<Bound>,
+    },
+    /// Drops rows the predicate does not admit.
+    Filter {
+        /// Where the rows come from.
+        input: Box<Plan>,
+        /// The condition. Only `TRUE` admits a row.
+        predicate: PlanExpr,
+    },
+    /// Computes the output columns.
+    Project {
+        /// Where the rows come from.
+        input: Box<Plan>,
+        /// One expression per output column.
+        exprs: Vec<PlanExpr>,
+        /// What to call each of them.
+        names: Vec<String>,
+    },
+    /// Orders rows. Blocking: it has to see them all before yielding any.
+    Sort {
+        /// Where the rows come from.
+        input: Box<Plan>,
+        /// What to sort by, and whether each key descends.
+        keys: Vec<(PlanExpr, bool)>,
+        /// How many rows are actually wanted, when a limit sits above.
+        top: Option<usize>,
+    },
+    /// Counts and stops.
+    Limit {
+        /// Where the rows come from.
+        input: Box<Plan>,
+        /// How many rows to yield, if bounded.
+        limit: Option<u64>,
+        /// How many to skip first.
+        offset: u64,
+    },
+    /// Writes rows into a table.
+    Insert {
+        /// The table being written to.
+        table: TableSchema,
+        /// One vector of expressions per row.
+        rows: Vec<Vec<PlanExpr>>,
+        /// Where each supplied value goes in the table's column order.
+        targets: Vec<usize>,
+    },
+    /// Adds a table to the catalog.
+    CreateTable {
+        /// The schema to record. Its root page is filled in when it runs.
+        schema: TableSchema,
+        /// Whether to do nothing when the table is already there.
+        if_not_exists: bool,
+    },
+    /// Starts a transaction.
+    Begin,
+    /// Ends one, keeping its work.
+    Commit,
+    /// Ends one, discarding its work.
+    Rollback,
+}
+
+impl TableSchema {
+    /// The column whose value is the row id, if the table has one.
+    ///
+    /// An `INTEGER PRIMARY KEY` becomes the key of the table's own tree rather
+    /// than a separate counter, so looking a row up by that column is a descent
+    /// rather than a scan. Same arrangement SQLite uses.
+    pub fn rowid_column(&self) -> Option<usize> {
+        self.columns
+            .iter()
+            .position(|column| column.primary_key && column.data_type == DataType::Integer)
+    }
+}
+
+/// Binds a statement against the catalog and plans it.
+pub fn plan(pool: &mut BufferPool, catalog: &Catalog, statement: &ast::Statement) -> Result<Plan> {
+    match statement {
+        ast::Statement::Begin => Ok(Plan::Begin),
+        ast::Statement::Commit => Ok(Plan::Commit),
+        ast::Statement::Rollback => Ok(Plan::Rollback),
+        ast::Statement::Select(select) => plan_select(pool, catalog, select),
+        ast::Statement::Insert(insert) => plan_insert(pool, catalog, insert),
+        ast::Statement::CreateTable(create) => plan_create_table(create),
+        ast::Statement::Explain(_) => Err(Error::Unsupported(
+            "EXPLAIN cannot wrap another EXPLAIN".into(),
+        )),
+        ast::Statement::Update(_) | ast::Statement::Delete(_) => Err(Error::Unsupported(
+            "UPDATE and DELETE are not implemented yet".into(),
+        )),
+        ast::Statement::CreateIndex(_) => Err(Error::Unsupported(
+            "secondary indexes are not implemented yet".into(),
+        )),
+    }
+}
+
+fn plan_select(pool: &mut BufferPool, catalog: &Catalog, select: &ast::Select) -> Result<Plan> {
+    if !select.joins.is_empty() {
+        return Err(Error::Unsupported("joins are not implemented yet".into()));
+    }
+    let table = catalog.require(pool, &select.from.name)?;
+    let scope = Scope::single(&table, select.from.alias.as_deref());
+
+    let filter = select
+        .filter
+        .as_ref()
+        .map(|expr| bind_expr(&scope, expr))
+        .transpose()?;
+
+    // Rule 1, access selection. A predicate that pins the row id down turns the
+    // scan into a descent, which is the whole reason the primary key is the key
+    // of the table's own tree.
+    let (lower, upper, residual) = match (&filter, table.rowid_column()) {
+        (Some(predicate), Some(rowid)) => split_rowid_bounds(predicate, rowid),
+        _ => (None, None, filter.clone()),
+    };
+
+    let mut plan = if lower.is_some() || upper.is_some() {
+        Plan::RowIdScan {
+            table: table.clone(),
+            lower,
+            upper,
+        }
+    } else {
+        Plan::SeqScan {
+            table: table.clone(),
+        }
+    };
+
+    // Rule 2, predicate pushdown. With one table the filter already sits
+    // directly above the scan; the rule earns its keep once joins exist.
+    if let Some(predicate) = residual {
+        plan = Plan::Filter {
+            input: Box::new(plan),
+            predicate,
+        };
+    }
+
+    // Rule 5, sort elimination. A scan already yields rows in row id order, so
+    // ordering by the primary key ascending is work that has already happened.
+    let keys: Vec<(PlanExpr, bool)> = select
+        .order_by
+        .iter()
+        .map(|item| Ok((bind_expr(&scope, &item.expr)?, item.descending)))
+        .collect::<Result<_>>()?;
+
+    let already_ordered = match table.rowid_column() {
+        Some(rowid) => keys
+            .iter()
+            .all(|(expr, descending)| !descending && *expr == PlanExpr::Column(rowid)),
+        None => keys.is_empty(),
+    };
+
+    if !keys.is_empty() && !already_ordered {
+        // Rule 6, limit pushdown. A limit above a sort becomes a bounded heap
+        // rather than sorting everything and throwing most of it away.
+        let top = select
+            .limit
+            .map(|limit| limit.saturating_add(select.offset.unwrap_or(0)) as usize);
+        plan = Plan::Sort {
+            input: Box::new(plan),
+            keys,
+            top,
+        };
+    }
+
+    let (exprs, names) = bind_projection(&scope, &select.projection)?;
+    plan = Plan::Project {
+        input: Box::new(plan),
+        exprs,
+        names,
+    };
+
+    if select.limit.is_some() || select.offset.is_some() {
+        plan = Plan::Limit {
+            input: Box::new(plan),
+            limit: select.limit,
+            offset: select.offset.unwrap_or(0),
+        };
+    }
+    Ok(plan)
+}
+
+fn plan_insert(pool: &mut BufferPool, catalog: &Catalog, insert: &ast::Insert) -> Result<Plan> {
+    let table = catalog.require(pool, &insert.table)?;
+
+    let targets: Vec<usize> = if insert.columns.is_empty() {
+        (0..table.columns.len()).collect()
+    } else {
+        insert
+            .columns
+            .iter()
+            .map(|name| {
+                table
+                    .column_index(name)
+                    .ok_or_else(|| Error::UnknownColumn(name.clone()))
+            })
+            .collect::<Result<_>>()?
+    };
+
+    // Values are constants and column references make no sense here, so the
+    // scope is empty and any name in a VALUES list is an error.
+    let scope = Scope::empty();
+    let mut rows = Vec::with_capacity(insert.rows.len());
+    for row in &insert.rows {
+        if row.len() != targets.len() {
+            return Err(Error::Unsupported(format!(
+                "the table takes {} values but {} were given",
+                targets.len(),
+                row.len()
+            )));
+        }
+        rows.push(
+            row.iter()
+                .map(|expr| bind_expr(&scope, expr))
+                .collect::<Result<Vec<_>>>()?,
+        );
+    }
+
+    Ok(Plan::Insert {
+        table,
+        rows,
+        targets,
+    })
+}
+
+fn plan_create_table(create: &ast::CreateTable) -> Result<Plan> {
+    let mut columns = Vec::with_capacity(create.columns.len());
+    for column in &create.columns {
+        let mut schema = ColumnSchema {
+            name: column.name.clone(),
+            data_type: column.data_type,
+            not_null: false,
+            primary_key: false,
+            default: None,
+        };
+        for constraint in &column.constraints {
+            match constraint {
+                ast::ColumnConstraint::PrimaryKey => {
+                    schema.primary_key = true;
+                    schema.not_null = true;
+                }
+                ast::ColumnConstraint::NotNull => schema.not_null = true,
+                ast::ColumnConstraint::Unique => {
+                    return Err(Error::Unsupported(
+                        "UNIQUE needs a secondary index, which is not implemented yet".into(),
+                    ))
+                }
+                ast::ColumnConstraint::Default(literal) => {
+                    schema.default = Some(literal_value(literal))
+                }
+            }
+        }
+        columns.push(schema);
+    }
+
+    if columns.is_empty() {
+        return Err(Error::Unsupported(
+            "a table needs at least one column".into(),
+        ));
+    }
+    if columns.iter().filter(|column| column.primary_key).count() > 1 {
+        return Err(Error::Unsupported(
+            "a table may have at most one primary key".into(),
+        ));
+    }
+
+    Ok(Plan::CreateTable {
+        schema: TableSchema {
+            name: create.name.clone(),
+            root: crate::NO_PAGE,
+            columns,
+        },
+        if_not_exists: create.if_not_exists,
+    })
+}
+
+// -- binding ---------------------------------------------------------------
+
+/// What names mean in one statement.
+struct Scope {
+    /// The name the table goes by, lowercased.
+    qualifier: Option<String>,
+    /// Column names, lowercased, in row order.
+    columns: Vec<String>,
+}
+
+impl Scope {
+    fn empty() -> Scope {
+        Scope {
+            qualifier: None,
+            columns: Vec::new(),
+        }
+    }
+
+    fn single(table: &TableSchema, alias: Option<&str>) -> Scope {
+        Scope {
+            qualifier: Some(alias.unwrap_or(&table.name).to_ascii_lowercase()),
+            columns: table
+                .columns
+                .iter()
+                .map(|column| column.name.to_ascii_lowercase())
+                .collect(),
+        }
+    }
+
+    fn resolve(&self, table: Option<&str>, name: &str) -> Result<usize> {
+        if let Some(qualifier) = table {
+            let matches = self
+                .qualifier
+                .as_deref()
+                .is_some_and(|own| own.eq_ignore_ascii_case(qualifier));
+            if !matches {
+                return Err(Error::UnknownTable(qualifier.to_string()));
+            }
+        }
+        self.columns
+            .iter()
+            .position(|column| column.eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::UnknownColumn(name.to_string()))
+    }
+}
+
+fn bind_projection(
+    scope: &Scope,
+    projection: &ast::Projection,
+) -> Result<(Vec<PlanExpr>, Vec<String>)> {
+    match projection {
+        ast::Projection::Star => Ok((
+            (0..scope.columns.len()).map(PlanExpr::Column).collect(),
+            scope.columns.clone(),
+        )),
+        ast::Projection::Items(items) => {
+            let mut exprs = Vec::with_capacity(items.len());
+            let mut names = Vec::with_capacity(items.len());
+            for item in items {
+                exprs.push(bind_expr(scope, &item.expr)?);
+                names.push(match (&item.alias, &item.expr) {
+                    (Some(alias), _) => alias.clone(),
+                    (None, ast::Expr::Column { name, .. }) => name.clone(),
+                    (None, expr) => expr.to_string(),
+                });
+            }
+            Ok((exprs, names))
+        }
+    }
+}
+
+fn bind_expr(scope: &Scope, expr: &ast::Expr) -> Result<PlanExpr> {
+    Ok(match expr {
+        ast::Expr::Literal(literal) => PlanExpr::Const(literal_value(literal)),
+        ast::Expr::Column { table, name } => {
+            PlanExpr::Column(scope.resolve(table.as_deref(), name)?)
+        }
+        ast::Expr::Unary { op, operand } => PlanExpr::Unary {
+            op: *op,
+            operand: Box::new(bind_expr(scope, operand)?),
+        },
+        ast::Expr::Binary { left, op, right } => PlanExpr::Binary {
+            left: Box::new(bind_expr(scope, left)?),
+            op: *op,
+            right: Box::new(bind_expr(scope, right)?),
+        },
+        ast::Expr::IsNull { operand, negated } => PlanExpr::IsNull {
+            operand: Box::new(bind_expr(scope, operand)?),
+            negated: *negated,
+        },
+        ast::Expr::Like {
+            left,
+            pattern,
+            negated,
+        } => PlanExpr::Like {
+            left: Box::new(bind_expr(scope, left)?),
+            pattern: Box::new(bind_expr(scope, pattern)?),
+            negated: *negated,
+        },
+        ast::Expr::Between {
+            operand,
+            low,
+            high,
+            negated,
+        } => PlanExpr::Between {
+            operand: Box::new(bind_expr(scope, operand)?),
+            low: Box::new(bind_expr(scope, low)?),
+            high: Box::new(bind_expr(scope, high)?),
+            negated: *negated,
+        },
+    })
+}
+
+fn literal_value(literal: &ast::Literal) -> Value {
+    match literal {
+        ast::Literal::Null => Value::Null,
+        ast::Literal::Bool(flag) => Value::Bool(*flag),
+        ast::Literal::Int(number) => Value::Int(*number),
+        ast::Literal::Real(number) => Value::Real(*number),
+        ast::Literal::Text(text) => Value::Text(text.clone()),
+    }
+}
+
+// -- rule 1: turning a predicate into a row id range ------------------------
+
+/// Pulls row id bounds out of a predicate, returning what is left over.
+///
+/// Only looks at conjuncts at the top level, because those are the ones that
+/// must all hold. A bound found under an `OR` would not be a bound at all.
+fn split_rowid_bounds(
+    predicate: &PlanExpr,
+    rowid: usize,
+) -> (Option<Bound>, Option<Bound>, Option<PlanExpr>) {
+    let mut conjuncts = Vec::new();
+    flatten_and(predicate, &mut conjuncts);
+
+    let mut lower: Option<Bound> = None;
+    let mut upper: Option<Bound> = None;
+    let mut residual = Vec::new();
+
+    for conjunct in conjuncts {
+        match rowid_bound_of(&conjunct, rowid) {
+            Some((low, high)) => {
+                lower = tighter(lower, low, true);
+                upper = tighter(upper, high, false);
+            }
+            None => residual.push(conjunct),
+        }
+    }
+
+    let leftover = residual.into_iter().reduce(|left, right| PlanExpr::Binary {
+        left: Box::new(left),
+        op: BinaryOp::And,
+        right: Box::new(right),
+    });
+    (lower, upper, leftover)
+}
+
+fn flatten_and(expr: &PlanExpr, out: &mut Vec<PlanExpr>) {
+    if let PlanExpr::Binary {
+        left,
+        op: BinaryOp::And,
+        right,
+    } = expr
+    {
+        flatten_and(left, out);
+        flatten_and(right, out);
+        return;
+    }
+    out.push(expr.clone());
+}
+
+/// The bounds one comparison puts on the row id, if it puts any.
+fn rowid_bound_of(expr: &PlanExpr, rowid: usize) -> Option<(Option<Bound>, Option<Bound>)> {
+    match expr {
+        PlanExpr::Binary { left, op, right } => {
+            // The column may be written on either side, and flipping the
+            // comparison is how `42 > id` becomes `id < 42`.
+            let (constant, op) = match (left.as_ref(), right.as_ref()) {
+                (PlanExpr::Column(index), PlanExpr::Const(Value::Int(value)))
+                    if *index == rowid =>
+                {
+                    (*value, *op)
+                }
+                (PlanExpr::Const(Value::Int(value)), PlanExpr::Column(index))
+                    if *index == rowid =>
+                {
+                    (*value, flip(*op))
+                }
+                _ => return None,
+            };
+
+            let inclusive = |value| {
+                Some(Bound {
+                    value,
+                    inclusive: true,
+                })
+            };
+            let exclusive = |value| {
+                Some(Bound {
+                    value,
+                    inclusive: false,
+                })
+            };
+            Some(match op {
+                BinaryOp::Eq => (inclusive(constant), inclusive(constant)),
+                BinaryOp::Greater => (exclusive(constant), None),
+                BinaryOp::GreaterEq => (inclusive(constant), None),
+                BinaryOp::Less => (None, exclusive(constant)),
+                BinaryOp::LessEq => (None, inclusive(constant)),
+                _ => return None,
+            })
+        }
+        PlanExpr::Between {
+            operand,
+            low,
+            high,
+            negated: false,
+        } => match (operand.as_ref(), low.as_ref(), high.as_ref()) {
+            (
+                PlanExpr::Column(index),
+                PlanExpr::Const(Value::Int(low)),
+                PlanExpr::Const(Value::Int(high)),
+            ) if *index == rowid => Some((
+                Some(Bound {
+                    value: *low,
+                    inclusive: true,
+                }),
+                Some(Bound {
+                    value: *high,
+                    inclusive: true,
+                }),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn flip(op: BinaryOp) -> BinaryOp {
+    match op {
+        BinaryOp::Less => BinaryOp::Greater,
+        BinaryOp::LessEq => BinaryOp::GreaterEq,
+        BinaryOp::Greater => BinaryOp::Less,
+        BinaryOp::GreaterEq => BinaryOp::LessEq,
+        other => other,
+    }
+}
+
+/// Keeps whichever of two bounds constrains more.
+fn tighter(current: Option<Bound>, candidate: Option<Bound>, is_lower: bool) -> Option<Bound> {
+    match (current, candidate) {
+        (None, other) => other,
+        (some, None) => some,
+        (Some(a), Some(b)) => {
+            let a_wins = if is_lower {
+                (a.value, !a.inclusive) > (b.value, !b.inclusive)
+            } else {
+                (a.value, a.inclusive) < (b.value, b.inclusive)
+            };
+            Some(if a_wins { a } else { b })
+        }
+    }
+}
+
+// -- EXPLAIN ---------------------------------------------------------------
+
+impl Plan {
+    /// Renders the plan the way `EXPLAIN` shows it.
+    ///
+    /// Written from the first day of this layer, because a planner whose choice
+    /// cannot be inspected is a planner nobody can debug, and the printed plan
+    /// is the cheapest test there is for the rules above.
+    pub fn explain(&self) -> String {
+        let mut out = String::new();
+        self.write_explain(&mut out, 0);
+        out
+    }
+
+    fn write_explain(&self, out: &mut String, depth: usize) {
+        let pad = "  ".repeat(depth);
+        match self {
+            Plan::SeqScan { table } => {
+                let _ = writeln!(out, "{pad}SeqScan {}", table.name);
+            }
+            Plan::RowIdScan {
+                table,
+                lower,
+                upper,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "{pad}RowIdScan {} ({})",
+                    table.name,
+                    describe_range(*lower, *upper)
+                );
+            }
+            Plan::Filter { input, predicate } => {
+                let _ = writeln!(out, "{pad}Filter {}", describe(predicate));
+                input.write_explain(out, depth + 1);
+            }
+            Plan::Project {
+                input,
+                exprs,
+                names,
+            } => {
+                let shown: Vec<String> = exprs
+                    .iter()
+                    .zip(names)
+                    .map(|(expr, name)| match expr {
+                        PlanExpr::Column(_) => name.clone(),
+                        other => format!("{} AS {name}", describe(other)),
+                    })
+                    .collect();
+                let _ = writeln!(out, "{pad}Project {}", shown.join(", "));
+                input.write_explain(out, depth + 1);
+            }
+            Plan::Sort { input, keys, top } => {
+                let shown: Vec<String> = keys
+                    .iter()
+                    .map(|(expr, descending)| {
+                        let direction = if *descending { " DESC" } else { " ASC" };
+                        format!("{}{direction}", describe(expr))
+                    })
+                    .collect();
+                match top {
+                    Some(n) => {
+                        let _ = writeln!(out, "{pad}Sort {} (top-{n})", shown.join(", "));
+                    }
+                    None => {
+                        let _ = writeln!(out, "{pad}Sort {}", shown.join(", "));
+                    }
+                }
+                input.write_explain(out, depth + 1);
+            }
+            Plan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
+                let mut line = format!("{pad}Limit");
+                if let Some(limit) = limit {
+                    let _ = write!(line, " n={limit}");
+                }
+                if *offset > 0 {
+                    let _ = write!(line, " offset={offset}");
+                }
+                let _ = writeln!(out, "{line}");
+                input.write_explain(out, depth + 1);
+            }
+            Plan::Insert { table, rows, .. } => {
+                let _ = writeln!(out, "{pad}Insert {} ({} rows)", table.name, rows.len());
+            }
+            Plan::CreateTable { schema, .. } => {
+                let _ = writeln!(out, "{pad}CreateTable {}", schema.name);
+            }
+            Plan::Begin => {
+                let _ = writeln!(out, "{pad}Begin");
+            }
+            Plan::Commit => {
+                let _ = writeln!(out, "{pad}Commit");
+            }
+            Plan::Rollback => {
+                let _ = writeln!(out, "{pad}Rollback");
+            }
+        }
+    }
+}
+
+fn describe_range(lower: Option<Bound>, upper: Option<Bound>) -> String {
+    match (lower, upper) {
+        (Some(low), Some(high)) if low == high && low.inclusive => format!("= {}", low.value),
+        (low, high) => {
+            let left = match low {
+                Some(bound) if bound.inclusive => format!(">= {}", bound.value),
+                Some(bound) => format!("> {}", bound.value),
+                None => "unbounded".into(),
+            };
+            let right = match high {
+                Some(bound) if bound.inclusive => format!("<= {}", bound.value),
+                Some(bound) => format!("< {}", bound.value),
+                None => "unbounded".into(),
+            };
+            format!("{left}, {right}")
+        }
+    }
+}
+
+fn describe(expr: &PlanExpr) -> String {
+    match expr {
+        PlanExpr::Const(value) => describe_value(value),
+        PlanExpr::Column(index) => format!("#{index}"),
+        PlanExpr::Unary { op, operand } => match op {
+            UnaryOp::Neg => format!("(-{})", describe(operand)),
+            UnaryOp::Not => format!("(NOT {})", describe(operand)),
+        },
+        PlanExpr::Binary { left, op, right } => {
+            format!("({} {} {})", describe(left), op.as_str(), describe(right))
+        }
+        PlanExpr::IsNull { operand, negated } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("({} IS {not}NULL)", describe(operand))
+        }
+        PlanExpr::Like {
+            left,
+            pattern,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!("({} {not}LIKE {})", describe(left), describe(pattern))
+        }
+        PlanExpr::Between {
+            operand,
+            low,
+            high,
+            negated,
+        } => {
+            let not = if *negated { "NOT " } else { "" };
+            format!(
+                "({} {not}BETWEEN {} AND {})",
+                describe(operand),
+                describe(low),
+                describe(high)
+            )
+        }
+    }
+}
+
+fn describe_value(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".into(),
+        Value::Bool(true) => "TRUE".into(),
+        Value::Bool(false) => "FALSE".into(),
+        Value::Int(number) => number.to_string(),
+        Value::Real(number) => format!("{number:?}"),
+        Value::Text(text) => format!("'{text}'"),
+        Value::Blob(bytes) => format!("<{} bytes>", bytes.len()),
+    }
+}
