@@ -90,3 +90,51 @@ jobs:
         env:
           LASTRO_FUZZ_SEEDS: "20000"
         run: cargo test --release --test crash_fuzz -- --nocapture
+
+  sqllogic:
+    name: sqllogictest, SQLite's own corpus
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup update stable && rustup default stable
+
+      # The corpus is fetched rather than vendored. Evidence a repository
+      # carries around is evidence that repository can edit; this way the files
+      # come from the project that wrote them, every run.
+      - name: Fetch the corpus
+        run: |
+          mkdir -p corpus
+          base=https://raw.githubusercontent.com/gregrahn/sqllogictest/master/test
+          for f in select1 select2 select3 select4 select5                    evidence/in1 evidence/slt_lang_createtrigger                    index/between/1/slt_good_0                    index/commute/10/slt_good_0                    random/expr/slt_good_0                    random/select/slt_good_0; do
+            out="corpus/$(echo "$f" | tr / _).test"
+            curl -fsSL --retry 3 "$base/$f.test" -o "$out" || echo "missing: $f"
+          done
+          ls -la corpus
+          wc -l corpus/*.test | tail -1
+
+      - name: Run it
+        env:
+          LASTRO_SQLLOGIC_DIR: corpus
+        run: cargo test --release --test sqllogic -- --nocapture
+
+  bench:
+    name: against SQLite
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup update stable && rustup default stable && rustup component add clippy
+
+      - name: Clippy on the benchmark
+        run: cargo clippy -p lastro-bench --all-targets -- -D warnings
+
+      # Smaller than a laptop run, because a shared CI runner is a noisy place
+      # to measure anything and the spread column will say so.
+      - name: Measure
+        env:
+          LASTRO_BENCH_ROWS: "5000"
+          LASTRO_BENCH_RUNS: "3"
+        run: cargo run --release -p lastro-bench
