@@ -31,8 +31,10 @@ number only goes in after it has been measured.
 | SQL: lexer, syntax tree, parser | done |
 | SQL: catalog, binder, planner, executor | done |
 | SQL: joins, secondary indexes, UPDATE, DELETE | done |
-| MVCC / snapshot isolation | not started |
-| Proof suite | partial: model and property tests done, crash fuzzer not |
+| MVCC: row versions, snapshots, the visibility rule | done |
+| MVCC: dead version collection | not started |
+| Proof: model, property, crash fuzzer | done |
+| Proof: sqllogictest, anomaly battery, benchmark | not started |
 
 What already runs: creating and opening a `.lastro` file, allocating and freeing pages with
 freelist reuse, storing variable-length cells in slotted pages with compaction, a B+Tree index
@@ -281,6 +283,34 @@ others made it.
 A second thing came with it, not a bug but undue strictness: opening refused a file shorter than
 the metadata claimed. After a crash that is normal, not corruption. The missing pages come back
 blank and recovery fills in whatever the log has to say about them.
+
+### The birth of a page that nobody wrote down
+
+The best find of this round, and the best hidden.
+
+Setting up a page writes the byte that says what it is: leaf, interior, heap.
+That byte is written **once**, at setup, and never again — no insert, delete or
+split ever touches it afterwards.
+
+And `BTree::create` set up the root page **outside any edit session**. The setup
+never became a log record.
+
+What followed: later inserts were logged normally, and each diff covered the
+bytes that changed — the slot count, the free space pointers, the new cell. The
+type byte was in no diff at all, because it was the same before and after. So
+after a crash, redo rebuilt the page's contents **onto a page that never learned
+what it was**, and the tree found no type at its own root.
+
+What makes it instructive: the "log only what changed" scheme is correct, and
+still loses information — because *never having changed* and *never having been
+written* are different things, and a diff cannot tell them apart. The missing
+rule is that **everything a page is has to go through the log, including the
+moment it came into being.**
+
+A second thing came with it: `begin_edit` now reports whether it opened the
+session, so a caller finding one already running leaves it to whoever started it.
+Closing somebody else's session early would log half an operation and call it
+whole.
 
 ### The redo that skipped everything, silently
 
