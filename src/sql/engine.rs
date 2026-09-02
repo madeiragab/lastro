@@ -200,6 +200,32 @@ impl Database {
                 let written = exec::insert(&mut self.pool, &table, &targets, &rows)?;
                 Ok(Outcome::Affected(written))
             }
+            Plan::Update {
+                table,
+                assignments,
+                filter,
+                lower,
+                upper,
+            } => {
+                let changed = exec::update(
+                    &mut self.pool,
+                    &table,
+                    &assignments,
+                    filter.as_ref(),
+                    lower,
+                    upper,
+                )?;
+                Ok(Outcome::Affected(changed))
+            }
+            Plan::Delete {
+                table,
+                filter,
+                lower,
+                upper,
+            } => {
+                let removed = exec::delete(&mut self.pool, &table, filter.as_ref(), lower, upper)?;
+                Ok(Outcome::Affected(removed))
+            }
             other => Err(Error::Unsupported(format!(
                 "{other:?} is not a statement that writes"
             ))),

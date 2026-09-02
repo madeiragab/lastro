@@ -366,3 +366,177 @@ fn a_table_larger_than_the_pool_still_reads_back() {
         100
     );
 }
+
+// -- changing rows ---------------------------------------------------------
+
+#[test]
+fn update_changes_only_what_the_filter_admits() {
+    let (_dir, mut db) = open();
+    herd(&mut db);
+
+    let outcome = db
+        .query("UPDATE gado SET peso = 500.0 WHERE id = 2")
+        .unwrap();
+    assert_eq!(outcome, Outcome::Affected(1));
+
+    let found = rows(&mut db, "SELECT peso FROM gado WHERE id = 2");
+    assert_eq!(found[0][0], Value::Real(500.0));
+    assert_eq!(
+        rows(&mut db, "SELECT peso FROM gado WHERE id = 1")[0][0],
+        Value::Real(431.5),
+        "the other rows are untouched"
+    );
+}
+
+#[test]
+fn update_can_read_the_row_it_is_changing() {
+    let (_dir, mut db) = open();
+    herd(&mut db);
+
+    db.query("UPDATE gado SET peso = peso + 100 WHERE peso IS NOT NULL")
+        .unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT peso FROM gado WHERE id = 1")[0][0],
+        Value::Real(531.5)
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT peso FROM gado WHERE id = 4")[0][0],
+        Value::Null,
+        "the null row was not admitted"
+    );
+}
+
+#[test]
+fn update_without_a_filter_touches_every_row() {
+    let (_dir, mut db) = open();
+    herd(&mut db);
+    assert_eq!(
+        db.query("UPDATE gado SET ativo = FALSE").unwrap(),
+        Outcome::Affected(5)
+    );
+    assert_eq!(rows(&mut db, "SELECT id FROM gado WHERE ativo").len(), 0);
+}
+
+#[test]
+fn changing_the_primary_key_moves_the_row() {
+    let (_dir, mut db) = open();
+    herd(&mut db);
+
+    db.query("UPDATE gado SET id = 99 WHERE id = 1").unwrap();
+    assert_eq!(rows(&mut db, "SELECT id FROM gado WHERE id = 1").len(), 0);
+
+    let moved = rows(&mut db, "SELECT brinco FROM gado WHERE id = 99");
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0][0], Value::Text("BR-0001".into()));
+    assert_eq!(
+        rows(&mut db, "SELECT id FROM gado").len(),
+        5,
+        "moving is not duplicating"
+    );
+}
+
+#[test]
+fn delete_removes_only_what_the_filter_admits() {
+    let (_dir, mut db) = open();
+    herd(&mut db);
+
+    assert_eq!(
+        db.query("DELETE FROM gado WHERE ativo = FALSE").unwrap(),
+        Outcome::Affected(2)
+    );
+    assert_eq!(rows(&mut db, "SELECT id FROM gado").len(), 3);
+
+    assert_eq!(
+        db.query("DELETE FROM gado").unwrap(),
+        Outcome::Affected(3)
+    );
+    assert_eq!(rows(&mut db, "SELECT id FROM gado").len(), 0);
+}
+
+#[test]
+fn a_write_narrows_to_a_descent_the_same_way_a_query_does() {
+    let (_dir, mut db) = open();
+    herd(&mut db);
+
+    let plan = plan_of(&mut db, "DELETE FROM gado WHERE id = 3");
+    assert!(plan.contains("RowIdScan gado (= 3)"), "{plan}");
+
+    let plan = plan_of(&mut db, "UPDATE gado SET peso = 1.0 WHERE id > 2 AND ativo");
+    assert!(plan.contains("RowIdScan gado (> 2"), "{plan}");
+    assert!(plan.contains("Filter"), "{plan}");
+}
+
+#[test]
+fn a_failed_update_leaves_every_row_as_it_was() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, nome TEXT NOT NULL)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .unwrap();
+
+    assert!(db.query("UPDATE t SET nome = NULL").is_err());
+    let names = rows(&mut db, "SELECT nome FROM t");
+    assert_eq!(names.len(), 3);
+    assert_eq!(names[0][0], Value::Text("a".into()));
+}
+
+#[test]
+fn changes_survive_a_crash_and_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("changed.lastro");
+
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap();
+        db.execute("BEGIN").unwrap();
+        for id in 1..=300i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({id}, {id})"))
+                .unwrap();
+        }
+        db.execute("COMMIT").unwrap();
+
+        db.query("UPDATE t SET n = n * 2 WHERE id <= 100").unwrap();
+        db.query("DELETE FROM t WHERE id > 200").unwrap();
+    }
+
+    let mut db = Database::open(&path).unwrap();
+    assert_eq!(rows(&mut db, "SELECT id FROM t").len(), 200);
+    assert_eq!(
+        rows(&mut db, "SELECT n FROM t WHERE id = 50")[0][0],
+        Value::Int(100)
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT n FROM t WHERE id = 150")[0][0],
+        Value::Int(150)
+    );
+}
+
+#[test]
+fn emptying_a_large_table_gives_its_pages_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = Database::with_capacity(dir.path().join("empty.lastro"), 32).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, texto TEXT)")
+        .unwrap();
+
+    let filler = "y".repeat(300);
+    db.execute("BEGIN").unwrap();
+    for id in 1..=600i64 {
+        db.execute(&format!("INSERT INTO t VALUES ({id}, '{filler}')"))
+            .unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+    db.checkpoint().unwrap();
+    let grown = db.pool_mut().pager().page_count();
+
+    db.query("DELETE FROM t").unwrap();
+    db.checkpoint().unwrap();
+
+    assert_eq!(rows(&mut db, "SELECT id FROM t").len(), 0);
+    let freed = db.pool_mut().pager().meta().freelist_count;
+    assert!(
+        freed > grown / 2,
+        "expected most of the {grown} pages back, got {freed}"
+    );
+    db.pool_mut().check_invariants().unwrap();
+}
