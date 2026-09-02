@@ -112,4 +112,4 @@ pub const NO_PAGE: PageId = 0;
 pub const MAGIC: [u8; 8] = *b"LASTRO\x00\x00";
 
 /// On-disk format version understood by this build.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
