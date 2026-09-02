@@ -6,9 +6,12 @@
 //! Reads and writes are positional, so the pager holds no mutable cursor state.
 //! See `docs/en/03-pager.md`.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
+
+use crate::storage::crash::CrashHandle;
 
 use crate::storage::page::{Page, PageType};
 use crate::util::crc32c;
@@ -136,6 +139,12 @@ pub struct Pager {
     file: File,
     meta: Meta,
     stats: IoStats,
+    /// Set only under the crash fuzzer. Pages written but not yet made durable,
+    /// which a simulated power loss discards. Ordered so that a partial flush
+    /// is reproducible from a seed.
+    pending: BTreeMap<PageId, Box<Page>>,
+    sim: Option<CrashHandle>,
+    truncated_pages: u64,
 }
 
 impl Pager {
@@ -150,6 +159,9 @@ impl Pager {
             file,
             meta: Meta::new(),
             stats: IoStats::default(),
+            pending: BTreeMap::new(),
+            sim: None,
+            truncated_pages: 0,
         };
         pager.flush_meta()?;
         pager.sync()?;
@@ -179,22 +191,39 @@ impl Pager {
         read_exact_at(&file, page.as_bytes_mut(), 0)?;
         let meta = Meta::read_from(&page)?;
 
+        // A file shorter than the metadata claims is a normal thing to find
+        // after a crash: the page count reached the disk and some of the pages
+        // it counts did not. The missing pages are blank here and recovery
+        // fills in whatever the log has to say about them.
         let pages_on_disk = length / PAGE_SIZE as u64;
-        if (meta.page_count as u64) > pages_on_disk {
-            return Err(Error::MalformedFile(format!(
-                "metadata claims {} pages but the file holds {pages_on_disk}",
-                meta.page_count
-            )));
-        }
+        let short_by = (meta.page_count as u64).saturating_sub(pages_on_disk);
 
-        Ok(Pager {
+        let mut pager = Pager {
             file,
             meta,
             stats: IoStats {
                 reads: 1,
                 ..IoStats::default()
             },
-        })
+            truncated_pages: 0,
+            pending: BTreeMap::new(),
+            sim: None,
+        };
+        if short_by > 0 {
+            let blank = Page::zeroed();
+            for id in pages_on_disk as u32..pager.meta.page_count {
+                write_all_at(&pager.file, blank.as_bytes(), offset_of(id))?;
+            }
+            pager.file.sync_all()?;
+            pager.truncated_pages = short_by;
+        }
+        Ok(pager)
+    }
+
+    /// How many pages the file was missing when it was opened, relative to what
+    /// the metadata claimed. Non-zero only after a crash.
+    pub fn truncated_pages(&self) -> u64 {
+        self.truncated_pages
     }
 
     /// Opens the file if it exists, creating it otherwise.
@@ -227,10 +256,30 @@ impl Pager {
         self.stats
     }
 
+    /// Arms a simulated power loss. Only the crash fuzzer does this.
+    pub fn arm_crash_sim(&mut self, sim: CrashHandle) {
+        self.sim = Some(sim);
+    }
+
+    /// Whether the simulated power has been cut.
+    pub fn crashed(&self) -> bool {
+        self.sim
+            .as_ref()
+            .map(|sim| sim.borrow().crashed())
+            .unwrap_or(false)
+    }
+
     /// Reads page `id` into `page`.
     pub fn read_page(&mut self, id: PageId, page: &mut Page) -> Result<()> {
         if id >= self.meta.page_count {
             return Err(Error::PageOutOfRange(id));
+        }
+        // A process sees its own writes even before they are durable, so the
+        // simulation has to serve them back.
+        if let Some(held) = self.pending.get(&id) {
+            page.as_bytes_mut().copy_from_slice(held.as_bytes());
+            self.stats.reads += 1;
+            return Ok(());
         }
         read_exact_at(&self.file, page.as_bytes_mut(), offset_of(id))?;
         self.stats.reads += 1;
@@ -241,6 +290,17 @@ impl Pager {
     pub fn write_page(&mut self, id: PageId, page: &Page) -> Result<()> {
         if id >= self.meta.page_count {
             return Err(Error::PageOutOfRange(id));
+        }
+        self.put_page(id, page)
+    }
+
+    fn put_page(&mut self, id: PageId, page: &Page) -> Result<()> {
+        if self.sim.is_some() {
+            // Held back. Under a power loss model a write means nothing until a
+            // sync makes it durable.
+            self.pending.insert(id, Box::new(page.clone()));
+            self.stats.writes += 1;
+            return Ok(());
         }
         write_all_at(&self.file, page.as_bytes(), offset_of(id))?;
         self.stats.writes += 1;
@@ -286,8 +346,7 @@ impl Pager {
             let id = self.meta.page_count;
             self.meta.page_count += 1;
             if id >= on_disk {
-                write_all_at(&self.file, blank.as_bytes(), offset_of(id))?;
-                self.stats.writes += 1;
+                self.put_page(id, &blank)?;
             }
         }
         Ok(())
@@ -317,14 +376,40 @@ impl Pager {
     pub fn flush_meta(&mut self) -> Result<()> {
         let mut page = Page::zeroed();
         self.meta.write_to(&mut page);
-        write_all_at(&self.file, page.as_bytes(), 0)?;
-        self.stats.writes += 1;
-        Ok(())
+        self.put_page(META_PAGE, &page)
     }
 
     /// Flushes the metadata page and forces everything to the physical medium.
     pub fn sync(&mut self) -> Result<()> {
         self.flush_meta()?;
+
+        if let Some(sim) = self.sim.clone() {
+            let mut held = std::mem::take(&mut self.pending);
+
+            // The metadata page counts the others, so it goes down last and
+            // only if all of them made it. A page count that reaches the disk
+            // ahead of the pages it counts describes a file that does not
+            // exist — which is exactly what the fuzzer caught the first time it
+            // ran.
+            let meta_page = held.remove(&META_PAGE);
+            let Some(landing) = sim.borrow_mut().admit(held.len()) else {
+                return Ok(());
+            };
+
+            let complete = landing == held.len();
+            for (id, page) in held.into_iter().take(landing) {
+                write_all_at(&self.file, page.as_bytes(), offset_of(id))?;
+            }
+            if complete {
+                if let Some(page) = meta_page {
+                    write_all_at(&self.file, page.as_bytes(), offset_of(META_PAGE))?;
+                }
+            }
+            self.file.sync_all()?;
+            self.stats.syncs += 1;
+            return Ok(());
+        }
+
         self.file.sync_all()?;
         self.stats.syncs += 1;
         Ok(())
