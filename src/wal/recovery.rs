@@ -52,12 +52,13 @@ pub fn recover(pool: &mut BufferPool) -> Result<RecoveryReport> {
         None => return Ok(RecoveryReport::default()),
     };
 
-    let (records, intact_len) = Wal::read_all(&path)?;
+    let base = pool.wal().expect("checked above").base_lsn();
+    let (records, intact_lsn) = Wal::read_all(&path, base)?;
     let file_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
     let mut report = RecoveryReport {
         records_scanned: records.len(),
-        torn_tail_bytes: file_len.saturating_sub(intact_len),
+        torn_tail_bytes: (base + file_len).saturating_sub(intact_lsn),
         ..RecoveryReport::default()
     };
 
@@ -66,7 +67,7 @@ pub fn recover(pool: &mut BufferPool) -> Result<RecoveryReport> {
     if report.torn_tail_bytes > 0 {
         pool.wal_mut()
             .expect("checked above")
-            .truncate_to(intact_len)?;
+            .truncate_to(intact_lsn)?;
     }
 
     if records.is_empty() {

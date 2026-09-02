@@ -97,22 +97,54 @@ impl PageEdit {
     /// The smallest edit that turns `before` into `after`, or `None` when the
     /// two images are identical.
     ///
-    /// This is what keeps whole-page rewrites from costing whole-page log
-    /// records: only the bytes that actually moved are written.
+    /// One contiguous range. Fine for a targeted change; poor for a whole page,
+    /// which is what [`PageEdit::runs`] is for.
     pub fn between(page: PageId, before: &[u8], after: &[u8]) -> Option<PageEdit> {
+        PageEdit::runs(page, before, after, usize::MAX).pop()
+    }
+
+    /// Every stretch of bytes that moved, as separate edits.
+    ///
+    /// A single range is a bad fit for a slotted page. Slots grow from the
+    /// front and cells from the back, so almost any change touches both ends
+    /// and one range spanning them covers the entire page — which would make
+    /// the logging physical in cost while physiological in form.
+    ///
+    /// Runs closer together than `gap` are merged, because a separate record
+    /// costs a header and it is not worth splitting to save a handful of bytes.
+    pub fn runs(page: PageId, before: &[u8], after: &[u8], gap: usize) -> Vec<PageEdit> {
         debug_assert_eq!(before.len(), after.len());
-        let first = before.iter().zip(after).position(|(a, b)| a != b)?;
-        let last = before
-            .iter()
-            .zip(after)
-            .rposition(|(a, b)| a != b)
-            .expect("a first difference implies a last one");
-        Some(PageEdit {
+
+        let mut out = Vec::new();
+        let mut start: Option<usize> = None;
+        let mut last = 0usize;
+
+        for index in 0..before.len() {
+            if before[index] != after[index] {
+                if start.is_none() {
+                    start = Some(index);
+                }
+                last = index;
+            } else if let Some(begin) = start {
+                if index - last > gap {
+                    out.push(PageEdit::span(page, before, after, begin, last));
+                    start = None;
+                }
+            }
+        }
+        if let Some(begin) = start {
+            out.push(PageEdit::span(page, before, after, begin, last));
+        }
+        out
+    }
+
+    fn span(page: PageId, before: &[u8], after: &[u8], begin: usize, last: usize) -> PageEdit {
+        PageEdit {
             page,
-            offset: first as u16,
-            before: before[first..=last].to_vec(),
-            after: after[first..=last].to_vec(),
-        })
+            offset: begin as u16,
+            before: before[begin..=last].to_vec(),
+            after: after[begin..=last].to_vec(),
+        }
     }
 
     /// How many bytes the edit covers.
@@ -466,6 +498,48 @@ mod tests {
         assert_eq!(edit.len(), 3, "10 through 12 inclusive");
         assert_eq!(edit.after, vec![1, 0, 1]);
         assert_eq!(edit.before, vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn runs_split_a_slotted_page_into_its_two_busy_ends() {
+        // The shape a slotted page actually changes in: a few header and slot
+        // bytes at the front, a cell at the back, and a wide untouched middle.
+        let mut before = [0u8; 4096];
+        let mut after = before;
+        after[2..8].fill(1);
+        after[4000..4096].fill(2);
+
+        let one = PageEdit::between(9, &before, &after).unwrap();
+        assert!(
+            one.len() > 4000,
+            "a single range has to span the whole page: {} bytes",
+            one.len()
+        );
+
+        let split = PageEdit::runs(9, &before, &after, 48);
+        assert_eq!(split.len(), 2, "front and back, with the middle left alone");
+        assert_eq!(split[0].offset, 2);
+        assert_eq!(split[0].len(), 6);
+        assert_eq!(split[1].offset, 4000);
+        assert_eq!(split[1].len(), 96);
+
+        // And applying them reproduces the page exactly.
+        for edit in &split {
+            let start = edit.offset as usize;
+            before[start..start + edit.len()].copy_from_slice(&edit.after);
+        }
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn runs_merge_when_the_gap_is_not_worth_a_record() {
+        let before = [0u8; 256];
+        let mut after = before;
+        after[10] = 1;
+        after[20] = 1;
+
+        assert_eq!(PageEdit::runs(9, &before, &after, 48).len(), 1);
+        assert_eq!(PageEdit::runs(9, &before, &after, 4).len(), 2);
     }
 
     #[test]
