@@ -32,9 +32,10 @@ número só entra depois de medido.
 | SQL: catálogo, binder, planner, executor | concluído |
 | SQL: junções, índices secundários, UPDATE, DELETE | concluído |
 | MVCC: versão de linha, snapshot, regra de visibilidade | concluído |
-| MVCC: coleta de versões mortas | não começado |
+| MVCC: coleta de versões mortas (`VACUUM`) | concluído |
 | Provas: modelo, propriedade, crash fuzzer | concluído |
-| Provas: sqllogictest, bateria de anomalias, benchmark | não começado |
+| Provas: bateria de anomalias | concluída |
+| Provas: sqllogictest, benchmark contra SQLite | não começado |
 
 O que já roda: criar e abrir um arquivo `.lastro`, alocar e liberar páginas com reuso pela
 freelist, guardar células de tamanho variável em slotted pages com compactação, um índice B+Tree
@@ -238,17 +239,38 @@ subconjunto de SQL implementado aqui.
 | Testes executados | pendente |
 | Aprovados | pendente |
 
-**Correção transacional** — as anomalias clássicas de isolamento. O objetivo não é passar em
-todas: snapshot isolation permite *write skew* por definição. A tabela mostra o que é prevenido
-e o que não é, porque um banco que mente sobre o próprio isolamento é pior que um banco lento.
+**Correção transacional** — as anomalias clássicas de isolamento, medidas em dois níveis
+porque respondem perguntas diferentes.
 
-| Anomalia | Prevenida? |
+O que a **regra de visibilidade** sozinha previne, exercitada com as histórias de versão que
+cada anomalia produziria:
+
+| Anomalia | Prevenida pela regra? |
 |---|---|
-| Dirty read | pendente |
-| Non-repeatable read | pendente |
-| Phantom read | pendente |
-| Lost update | pendente |
-| Write skew | pendente |
+| Dirty read | ✅ |
+| Non-repeatable read | ✅ |
+| Phantom read | ✅ |
+| Write skew | ❌ |
+
+O `❌` é o esperado. Snapshot isolation permite write skew por definição, e há um teste que
+**afirma a anomalia** em vez de escondê-la. Se um dia o isolamento for endurecido, esse teste
+falha — e a falha é o aviso correto de que a documentação precisa mudar junto.
+
+O que o **motor** previne, que é outra coisa:
+
+| Anomalia | Prevenida no motor? | Por quê |
+|---|---|---|
+| Dirty read | ✅ | a regra de visibilidade |
+| Non-repeatable read | ✅ | o snapshot segurado desde o `BEGIN` |
+| Phantom read | ✅ | o mesmo snapshot |
+| Lost update | ✅ | um escritor por vez |
+| Write skew | ✅ | um escritor por vez |
+
+**As duas últimas linhas não são mérito do isolamento.** São consequência de o motor recusar um
+segundo escritor: a escala das duas transações não pode nem ser construída. Uma bateria que só
+rodasse o motor reportaria "prevenida" para as cinco e estaria reportando o modelo de
+concorrência enquanto parece reportar o nível de isolamento. Essa distinção é o motivo de a
+bateria ter dois níveis.
 
 **Desempenho** — comparação com SQLite nas mesmas cargas. Expectativa: o `lastro` perde por
 margem larga. O SQLite tem 25 anos de otimização. Os gráficos vão ser publicados perdendo, junto
