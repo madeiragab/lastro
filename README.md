@@ -2,6 +2,8 @@
 
 **Português** · [English](README.en.md)
 
+[![CI](https://github.com/madeiragab/lastro/actions/workflows/ci.yml/badge.svg)](https://github.com/madeiragab/lastro/actions/workflows/ci.yml)
+
 **Um banco de dados relacional embutido, escrito do zero em Rust.**
 
 Páginas em disco, B+Tree, write-ahead log com crash recovery, parser SQL e MVCC.
@@ -18,12 +20,20 @@ número só entra depois de medido.
 | Camada | Estado |
 |---|---|
 | Especificação e documentação | concluída |
-| Pager / buffer pool | em andamento |
+| Formato de arquivo, slotted page, codificações | concluído |
+| Pager e freelist | concluído |
+| Buffer pool com política clock | concluído |
 | B+Tree | não começado |
 | WAL + crash recovery | não começado |
 | SQL (parser, planner, executor) | não começado |
 | MVCC / snapshot isolation | não começado |
-| Suíte de provas | não começado |
+| Suíte de provas | parcial: modelo e propriedade prontos, crash fuzzer não |
+
+O que já roda: criar e abrir um arquivo `.lastro`, alocar e liberar páginas com reuso pela
+freelist, guardar células de tamanho variável em slotted pages com compactação, ler e escrever
+tudo isso através de um buffer pool de tamanho fixo, e inspecionar o arquivo pelo `lastro-cli`.
+
+Sem dependência nenhuma na biblioteca: CRC32C, varint e as codificações são escritos aqui.
 
 ---
 
@@ -101,16 +111,33 @@ Detalhes em [05 · WAL e recovery](docs/pt/05-wal-recovery.md) e [08 · Testes](
 
 ## Como rodar
 
+Testes, incluindo os de modelo e os baseados em propriedade:
+
 ```bash
 cargo test
 ```
 
+Cria um banco vazio:
+
 ```bash
-cargo run --bin lastro-cli -- exemplo.lastro
+cargo run --bin lastro-cli -- create exemplo.lastro
 ```
 
-*(Ainda não funciona. A seção existe para lembrar que a experiência de uso importa tanto quanto
-o motor.)*
+Lê a página de metadados e confere as invariantes:
+
+```bash
+cargo run --bin lastro-cli -- info exemplo.lastro
+```
+
+Resume todas as páginas do arquivo, ou abre uma:
+
+```bash
+cargo run --bin lastro-cli -- pages exemplo.lastro
+```
+
+```bash
+cargo run --bin lastro-cli -- page exemplo.lastro 1
+```
 
 ---
 

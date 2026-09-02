@@ -2,6 +2,8 @@
 
 [Português](README.md) · **English**
 
+[![CI](https://github.com/madeiragab/lastro/actions/workflows/ci.yml/badge.svg)](https://github.com/madeiragab/lastro/actions/workflows/ci.yml)
+
 **An embedded relational database, written from scratch in Rust.**
 
 On-disk pages, B+Tree, write-ahead log with crash recovery, SQL parser and MVCC.
@@ -18,12 +20,20 @@ number only goes in after it has been measured.
 | Layer | State |
 |---|---|
 | Specification and documentation | done |
-| Pager / buffer pool | in progress |
+| File format, slotted page, encodings | done |
+| Pager and freelist | done |
+| Buffer pool with clock policy | done |
 | B+Tree | not started |
 | WAL + crash recovery | not started |
 | SQL (parser, planner, executor) | not started |
 | MVCC / snapshot isolation | not started |
-| Proof suite | not started |
+| Proof suite | partial: model and property tests done, crash fuzzer not |
+
+What already runs: creating and opening a `.lastro` file, allocating and freeing pages with
+freelist reuse, storing variable-length cells in slotted pages with compaction, reading and
+writing all of it through a fixed-size buffer pool, and inspecting the file with `lastro-cli`.
+
+The library has no dependencies: CRC32C, the varint codec and the encodings are written here.
 
 ---
 
@@ -104,16 +114,33 @@ project. Details in [05 · WAL and recovery](docs/en/05-wal-recovery.md) and
 
 ## Running it
 
+The tests, model-based and property-based ones included:
+
 ```bash
 cargo test
 ```
 
+Create an empty database:
+
 ```bash
-cargo run --bin lastro-cli -- example.lastro
+cargo run --bin lastro-cli -- create example.lastro
 ```
 
-*(Does not work yet. The section exists as a reminder that the usage experience matters as much
-as the engine.)*
+Read the metadata page and check its invariants:
+
+```bash
+cargo run --bin lastro-cli -- info example.lastro
+```
+
+Summarize every page in the file, or open one:
+
+```bash
+cargo run --bin lastro-cli -- pages example.lastro
+```
+
+```bash
+cargo run --bin lastro-cli -- page example.lastro 1
+```
 
 ---
 
