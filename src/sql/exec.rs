@@ -6,12 +6,15 @@
 //! and it is the only one that does.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use crate::index::{BTree, Cursor};
 use crate::sql::ast::{BinaryOp, DataType, UnaryOp};
 use crate::sql::catalog::TableSchema;
 use crate::sql::plan::{Bound, Plan, PlanExpr};
-use crate::storage::page::encoding::{decode_tuple, encode_i64, encode_tuple, Value, ValueType};
+use crate::storage::page::encoding::{
+    decode_tuple, encode_i64, encode_key, encode_tuple, Value, ValueType,
+};
 use crate::storage::BufferPool;
 use crate::{Error, Result};
 
@@ -287,6 +290,41 @@ pub enum Op {
         /// The sorted rows, once the input has been drained.
         buffered: Option<std::vec::IntoIter<Row>>,
     },
+    /// Pairs every outer row with every inner row, keeping what the condition
+    /// admits.
+    ///
+    /// The inner side is read once and kept, rather than walked again per outer
+    /// row: a cursor cannot be rewound, and re-descending the tree for every
+    /// outer row would cost more than the rows themselves.
+    NestedLoopJoin {
+        /// The outer input.
+        left: Box<Op>,
+        /// The inner input, already drained.
+        right: Vec<Row>,
+        /// The condition, over the two rows joined end to end.
+        on: PlanExpr,
+        /// The outer row being paired.
+        current: Option<Row>,
+        /// How far into the inner rows that pairing has got.
+        at: usize,
+    },
+    /// Builds a table from one side and probes it with the other.
+    HashJoin {
+        /// The side the table is built from.
+        left: Box<Op>,
+        /// The side that probes it.
+        right: Box<Op>,
+        /// The key on the build side, over a joined row.
+        left_key: PlanExpr,
+        /// The key on the probe side, over a row of the right input alone.
+        right_key: PlanExpr,
+        /// Whatever the equality did not cover.
+        residual: Option<PlanExpr>,
+        /// The table, once the build side has been drained.
+        built: Option<HashMap<Vec<u8>, Vec<Row>>>,
+        /// Matches still to be yielded for the current probe row.
+        pending: Vec<Row>,
+    },
     /// Counts and stops.
     Limit {
         /// Where rows come from.
@@ -381,6 +419,83 @@ impl Op {
                 Ok(buffered.as_mut().expect("filled above").next())
             }
 
+            Op::NestedLoopJoin {
+                left,
+                right,
+                on,
+                current,
+                at,
+            } => loop {
+                if current.is_none() {
+                    *current = left.next(pool)?;
+                    *at = 0;
+                    if current.is_none() {
+                        return Ok(None);
+                    }
+                }
+                let outer = current.as_ref().expect("filled above");
+                if *at >= right.len() {
+                    *current = None;
+                    continue;
+                }
+
+                let mut joined = outer.clone();
+                joined.extend_from_slice(&right[*at]);
+                *at += 1;
+                if truth(&eval(on, &joined)?) == Some(true) {
+                    return Ok(Some(joined));
+                }
+            },
+
+            Op::HashJoin {
+                left,
+                right,
+                left_key,
+                right_key,
+                residual,
+                built,
+                pending,
+            } => {
+                if built.is_none() {
+                    let mut table: HashMap<Vec<u8>, Vec<Row>> = HashMap::new();
+                    while let Some(row) = left.next(pool)? {
+                        // A null never equals anything, so a row keyed by one
+                        // simply cannot match and is left out of the table.
+                        if let Some(key) = hash_key(left_key, &row)? {
+                            table.entry(key).or_default().push(row);
+                        }
+                    }
+                    *built = Some(table);
+                }
+                let table = built.as_ref().expect("filled above");
+
+                loop {
+                    if let Some(row) = pending.pop() {
+                        return Ok(Some(row));
+                    }
+                    let Some(probe) = right.next(pool)? else {
+                        return Ok(None);
+                    };
+                    let Some(key) = hash_key(right_key, &probe)? else {
+                        continue;
+                    };
+                    let Some(matches) = table.get(&key) else {
+                        continue;
+                    };
+                    for build in matches {
+                        let mut joined = build.clone();
+                        joined.extend_from_slice(&probe);
+                        let admitted = match residual {
+                            Some(rest) => truth(&eval(rest, &joined)?) == Some(true),
+                            None => true,
+                        };
+                        if admitted {
+                            pending.push(joined);
+                        }
+                    }
+                }
+            }
+
             Op::Limit {
                 input,
                 remaining,
@@ -405,6 +520,20 @@ impl Op {
             }
         }
     }
+}
+
+/// The bytes a join key hashes as, or `None` when it is null.
+///
+/// Reuses the order preserving key encoding rather than inventing a second one:
+/// it already turns any value into bytes that compare, and bytes hash.
+fn hash_key(expr: &PlanExpr, row: &[Value]) -> Result<Option<Vec<u8>>> {
+    let value = eval(expr, row)?;
+    if matches!(value, Value::Null) {
+        return Ok(None);
+    }
+    let mut out = Vec::new();
+    encode_key(&[value], &mut out)?;
+    Ok(Some(out))
 }
 
 fn null_order(left: &Value, right: &Value) -> Ordering {
@@ -440,6 +569,35 @@ pub fn build(plan: &Plan, pool: &mut BufferPool) -> Result<Op> {
                 )?,
             }
         }
+        Plan::NestedLoopJoin { left, right, on } => {
+            let mut inner = build(right, pool)?;
+            let mut rows = Vec::new();
+            while let Some(row) = inner.next(pool)? {
+                rows.push(row);
+            }
+            Op::NestedLoopJoin {
+                left: Box::new(build(left, pool)?),
+                right: rows,
+                on: on.clone(),
+                current: None,
+                at: 0,
+            }
+        }
+        Plan::HashJoin {
+            left,
+            right,
+            left_key,
+            right_key,
+            residual,
+        } => Op::HashJoin {
+            left: Box::new(build(left, pool)?),
+            right: Box::new(build(right, pool)?),
+            left_key: left_key.clone(),
+            right_key: right_key.clone(),
+            residual: residual.clone(),
+            built: None,
+            pending: Vec::new(),
+        },
         Plan::Filter { input, predicate } => Op::Filter {
             input: Box::new(build(input, pool)?),
             predicate: predicate.clone(),
