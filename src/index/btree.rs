@@ -139,6 +139,78 @@ impl BTree {
         self.range(pool, None, None)
     }
 
+    /// A cursor that walks the tree one entry at a time.
+    ///
+    /// This is what the executor scans with. Unlike [`BTree::range`] it holds
+    /// nothing but a leaf number and a slot between calls, so it never keeps a
+    /// pin across a `next` and the pool stays free to evict around it.
+    ///
+    /// The price of holding no pin is that the cursor is only valid while the
+    /// tree is not being modified. Every scan in the executor reads a tree that
+    /// the same statement is not writing, which is the condition that makes
+    /// this safe.
+    pub fn cursor(&self, pool: &mut BufferPool, lower: Option<&[u8]>) -> Result<Cursor> {
+        let start = lower.unwrap_or(b"");
+        let mut path = Vec::new();
+        let pin = self.descend(pool, start, &mut path)?;
+        release(pool, &mut path);
+
+        let slot = node::leaf_search(pool.page(&pin), start).0;
+        let leaf = pin.page_id;
+        pool.unpin(pin);
+
+        Ok(Cursor {
+            leaf,
+            slot,
+            upper: None,
+        })
+    }
+
+    /// A cursor bounded above, stopping before `upper`.
+    pub fn cursor_range(
+        &self,
+        pool: &mut BufferPool,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Result<Cursor> {
+        let mut cursor = self.cursor(pool, lower)?;
+        cursor.upper = upper.map(|key| key.to_vec());
+        Ok(cursor)
+    }
+
+    /// The largest key in the tree, or `None` when it is empty.
+    ///
+    /// Descends the rightmost spine, which is what hands out the next row id
+    /// without the catalog having to store a counter and rewrite it on every
+    /// insert.
+    pub fn last_key(&self, pool: &mut BufferPool) -> Result<Option<Vec<u8>>> {
+        let mut pin = pool.fetch(self.root)?;
+        loop {
+            match pool.page(&pin).page_type() {
+                Some(PageType::Leaf) => {
+                    let count = pool.page(&pin).slot_count();
+                    let key = if count == 0 {
+                        None
+                    } else {
+                        let cell = pool.page(&pin).cell(count - 1).expect("a live slot");
+                        node::leaf_key(cell).map(|key| key.to_vec())
+                    };
+                    pool.unpin(pin);
+                    return Ok(key);
+                }
+                Some(PageType::Interior) => {
+                    let child = pool.page(&pin).extra();
+                    pool.unpin(pin);
+                    pin = pool.fetch(child)?;
+                }
+                other => {
+                    pool.unpin(pin);
+                    return Err(broken(format!("page type {other:?} inside a btree")));
+                }
+            }
+        }
+    }
+
     // -- writes ------------------------------------------------------------
 
     /// Inserts a key, replacing any value already stored under it.
@@ -627,6 +699,53 @@ pub struct TreeStats {
     pub mean_occupancy_percent: usize,
     /// The emptiest non-root page, in percent of usable space.
     pub min_occupancy_percent: usize,
+}
+
+/// Walks a tree in key order, one entry per call.
+///
+/// See [`BTree::cursor`] for why it holds no pin between calls, and what that
+/// costs.
+#[derive(Debug, Clone)]
+pub struct Cursor {
+    leaf: PageId,
+    slot: u16,
+    upper: Option<Vec<u8>>,
+}
+
+impl Cursor {
+    /// The next entry, or `None` at the end of the range.
+    pub fn next(&mut self, pool: &mut BufferPool) -> Result<Option<Entry>> {
+        loop {
+            if self.leaf == NO_PAGE {
+                return Ok(None);
+            }
+            let pin = pool.fetch(self.leaf)?;
+            let page = pool.page(&pin);
+
+            if self.slot >= page.slot_count() {
+                self.leaf = page.extra();
+                self.slot = 0;
+                pool.unpin(pin);
+                continue;
+            }
+
+            let cell = page
+                .cell(self.slot)
+                .expect("btree pages have no dead slots");
+            let (key, value) = node::decode_leaf_cell(cell).expect("well formed leaf cell");
+            let entry = (key.to_vec(), value.to_vec());
+            pool.unpin(pin);
+            self.slot += 1;
+
+            if let Some(limit) = &self.upper {
+                if entry.0 >= *limit {
+                    self.leaf = NO_PAGE;
+                    return Ok(None);
+                }
+            }
+            return Ok(Some(entry));
+        }
+    }
 }
 
 // -- node representation ---------------------------------------------------
