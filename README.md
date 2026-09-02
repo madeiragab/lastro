@@ -14,8 +14,8 @@ linha por linha, o que um banco de dados faz entre o seu `INSERT` e o dado estar
 
 ## Status
 
-Em construção. Nada aqui é estável, e as tabelas de resultado estão vazias de propósito —
-número só entra depois de medido.
+Em construção. Nada aqui é estável. Todo número nas tabelas de resultado foi medido, com o
+comando ao lado para reproduzir; nenhum foi estimado.
 
 | Camada | Estado |
 |---|---|
@@ -35,13 +35,13 @@ número só entra depois de medido.
 | MVCC: coleta de versões mortas (`VACUUM`) | concluído |
 | Provas: modelo, propriedade, crash fuzzer | concluído |
 | Provas: bateria de anomalias | concluída |
-| Provas: sqllogictest, benchmark contra SQLite | não começado |
+| Provas: sqllogictest, benchmark contra SQLite | concluído |
 
 O que já roda: criar e abrir um arquivo `.lastro`, alocar e liberar páginas com reuso pela
 freelist, guardar células de tamanho variável em slotted pages com compactação, um índice B+Tree
 com split e fusão sobre isso, um write-ahead log com recovery ARIES completo, e uma camada SQL
-com `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT` com junções, `UPDATE`, `DELETE` e
-`EXPLAIN`.
+com `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT` com junções, `DISTINCT` e `ORDER BY`,
+`UPDATE`, `DELETE`, `VACUUM` e `EXPLAIN`.
 
 Uma transação confirmada sobrevive a uma queda que perdeu a página, e uma não confirmada é
 desfeita mesmo que a página já tenha chegado ao disco. A regra WAL está no caminho de despejo do
@@ -231,13 +231,40 @@ escrita que já chegou ao sistema operacional continua no cache e é gravada dep
 jeito. O dado sobrevive, a regra WAL nunca é pressionada, e o teste passa exista a regra ou não.
 O que está modelado é o que de fato importa — **só o que passou por `fsync` sobrevive.**
 
-**Compatibilidade** — a suíte SQL Logic Test do SQLite, escrita por terceiros, rodada contra o
-subconjunto de SQL implementado aqui.
+**Compatibilidade** — o corpus do sqllogictest, escrito pelo projeto SQLite anos antes deste
+existir. Todo outro teste aqui foi escrito pela mesma pessoa que escreveu o código testado, que é
+o tipo mais fraco de evidência que existe: só prova que o motor faz o que o autor esperava. Este
+não faz ideia do que o `lastro` acha fácil.
 
 | Métrica | Valor |
 |---|---|
-| Testes executados | pendente |
-| Aprovados | pendente |
+| Arquivos considerados | 11 |
+| Arquivos rodados até o fim | 6 |
+| Arquivos abandonados no setup | 5 |
+| Asserções tentadas | 9.172 |
+| Aprovadas | **9.172** |
+| Reprovadas | **0** |
+| Puladas por recurso ausente | 16.924 |
+
+**100,0% do que rodou. E 35,1% do corpus conseguiu rodar.** Os dois números andam juntos de
+propósito: publicar "100% de aprovação" escondendo que dois terços das asserções nem foram
+tentadas seria mentira estatística. O denominador viaja junto com o numerador, sempre.
+
+Recurso ausente **não** é reprovação — é ausência, e cada uma sai listada com quantas vezes o
+corpus pediu por ela. As maiores: chamada de função (6.243), `SELECT` sem `FROM` (4.577),
+`SELECT` de várias tabelas separadas por vírgula (1.970), subconsulta escalar (1.149),
+`CROSS JOIN` (237), `EXISTS` (179). Cinco arquivos param logo no `CREATE`, por `INSERT ... SELECT`
+e por `CREATE TRIGGER`.
+
+Reproduzir: `LASTRO_SQLLOGIC_DIR=<dir> cargo test --release --test sqllogic -- --nocapture`. O
+corpus é **baixado pela integração contínua, não versionado aqui** — evidência que o repositório
+carrega junto é evidência que o repositório pode editar.
+
+O corpus achou três bugs de verdade, todos do tipo pior: resposta errada sem erro nenhum.
+`DISTINCT` era lido como nome de coluna, `ORDER BY 1` ordenava por uma constante, e nomes de tipo
+como `VARCHAR(8)` recusavam o esquema inteiro. Os dois primeiros estão no diário de bugs. É
+exatamente para isso que se pega o teste de outra pessoa: ela pergunta o que o autor não pensaria
+em perguntar.
 
 **Correção transacional** — as anomalias clássicas de isolamento, medidas em dois níveis
 porque respondem perguntas diferentes.
@@ -272,16 +299,78 @@ rodasse o motor reportaria "prevenida" para as cinco e estaria reportando o mode
 concorrência enquanto parece reportar o nível de isolamento. Essa distinção é o motivo de a
 bateria ter dois níveis.
 
-**Desempenho** — comparação com SQLite nas mesmas cargas. Expectativa: o `lastro` perde por
-margem larga. O SQLite tem 25 anos de otimização. Os gráficos vão ser publicados perdendo, junto
-da análise de onde o tempo vai embora. Benchmark interessante não é o que mostra quem ganhou, é
-o que explica por quê.
+**Desempenho** — contra o SQLite 3.46, nas mesmas cargas e com a **mesma durabilidade**: os dois
+com log de escrita adiantada e `fsync` a cada commit, 2 MiB de cache cada, e os dois obrigados a
+reanalisar o texto de cada comando, porque o `lastro` não tem statement preparado. Medir contra
+`synchronous = NORMAL` seria comparar um banco que sobrevive a queda de energia com um que não.
+
+5.000 linhas, 3 execuções, mediana. Máquina compartilhada da integração contínua — a coluna de
+dispersão diz o quanto confiar.
+
+| Carga | lastro | SQLite | razão |
+|---|---|---|---|
+| Inserção em ordem de chave | 17,0 µs/linha | 1,9 µs/linha | 9,1× mais lento |
+| Inserção em ordem aleatória | 27,1 µs/linha | 2,1 µs/linha | 12,6× mais lento |
+| Busca pela chave primária | 3,2 µs/busca | 5,3 µs/busca | 0,6× |
+| Varredura de 10% da tabela | 114,0 µs/varredura | 42,7 µs/varredura | 2,7× mais lento |
+| Atualização pela chave primária | 32,3 µs/atualização | 2,5 µs/atualização | 12,9× mais lento |
+| Uma linha por transação | 378,1 µs/commit | 272,5 µs/commit | 1,4× mais lento |
+
+**A linha de busca não é vitória.** Com 5.000 linhas a tabela inteira cabe no cache dos dois, então
+o que está sendo medido é analisar o comando mais uma descida na árvore. A gramática do `lastro` é
+uma fração da do SQLite, então o analisador dele é mais rápido por ser menor, não por ser melhor.
+Trocar a comparação para statement preparado dos dois lados inverteria essa linha na hora.
+
+**Onde o tempo vai embora nas escritas.** Toda mutação da B+Tree aqui lê o nó inteiro para vetores,
+edita e escreve de volta: é O(tamanho da página) com alocação por inserção, onde o SQLite mexe na
+página no lugar. Somado a isso, cada inserção abre uma sessão de edição e registra seu diff no log.
+São as duas decisões que aparecem no 9× e no 12×, e as duas foram tomadas por clareza — o código
+que reconstrói o nó é legível, o que edita in loco não é. Está documentado como custo, não como
+surpresa.
+
+**A varredura** paga por o cursor não segurar pin entre chamadas: cada linha refixa o quadro no
+buffer pool. Foi escolha deliberada (um cursor que segura pin é um cursor que trava o pool), e o
+2,7× é o preço.
+
+**A última linha é a que valida a medição.** Quando todo commit custa um `fsync`, o disco domina e
+a diferença entre os motores encolhe para 1,4×. Se essa linha mostrasse 10× também, seria sinal de
+que a comparação estava medindo outra coisa.
+
+Reproduzir: `cargo run --release -p lastro-bench`. O programa imprime os planos junto dos tempos,
+porque razão sem plano não explica nada.
+
 
 ---
 
 ## Diário de bugs
 
 Registro dos erros que custaram caro, porque é a parte que de fato ensinou alguma coisa.
+
+### O `ORDER BY` que ordenava por nada
+
+`ORDER BY 1` significa a primeira coluna de saída. O planner lia o `1` como o número um, ligava a
+ordenação a uma constante, e ordenar por constante não é ordenar: as linhas voltavam na ordem em
+que a varredura as produziu. Todo valor correto, a ordem errada, e erro nenhum em lugar nenhum.
+
+É a categoria mais perigosa de bug que existe — o que produz uma resposta plausível. Nenhum teste
+próprio pegou, porque para escrever um teste de `ORDER BY 1` é preciso primeiro achar que ele podia
+estar quebrado. O corpus do SQLite achou 43 casos de uma vez.
+
+O conserto tem uma sutileza: a ordenação fica **abaixo** da projeção no plano, então o ordinal não
+pode virar "coluna de saída n" — essa coluna ainda não existe. Ele vira a expressão a partir da
+qual aquela coluna é calculada. E um ordinal fora da saída passa a ser recusado, em vez de ignorado.
+
+### O `DISTINCT` que era o nome de uma coluna
+
+`DISTINCT` não estava na lista de palavras-chave, então `SELECT DISTINCT cor FROM t` era analisado
+como uma coluna chamada `DISTINCT` com apelido `cor`, e falhava com "não existe coluna chamada
+DISTINCT". O erro chega a parecer honesto, e é o contrário: o front end aceitou o comando e
+respondeu outra coisa. Ausência de recurso deveria ser recusa no analisador, nunca uma queixa sobre
+o esquema.
+
+Vale a distinção porque o runner do sqllogictest classifica exatamente por essa linha: o que o
+analisador recusa é ausência, o que ele aceita e depois erra é bug deste projeto. Enquanto
+`DISTINCT` virava nome de coluna, ele contava como bug — corretamente.
 
 ### A página de metadados que descia antes das outras
 
