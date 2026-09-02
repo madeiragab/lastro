@@ -446,10 +446,7 @@ fn delete_removes_only_what_the_filter_admits() {
     );
     assert_eq!(rows(&mut db, "SELECT id FROM gado").len(), 3);
 
-    assert_eq!(
-        db.query("DELETE FROM gado").unwrap(),
-        Outcome::Affected(3)
-    );
+    assert_eq!(db.query("DELETE FROM gado").unwrap(), Outcome::Affected(3));
     assert_eq!(rows(&mut db, "SELECT id FROM gado").len(), 0);
 }
 
@@ -539,4 +536,171 @@ fn emptying_a_large_table_gives_its_pages_back() {
         "expected most of the {grown} pages back, got {freed}"
     );
     db.pool_mut().check_invariants().unwrap();
+}
+
+// -- joins -----------------------------------------------------------------
+
+fn weighings(db: &mut Database) {
+    herd(db);
+    db.execute(
+        "CREATE TABLE pesagem (id INTEGER PRIMARY KEY, gado_id INTEGER, kg REAL);
+         INSERT INTO pesagem VALUES
+            (1, 1, 431.5),
+            (2, 1, 445.0),
+            (3, 2, 380.0),
+            (4, 3, 512.25),
+            (5, 99, 1.0);",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_join_pairs_the_rows_that_match() {
+    let (_dir, mut db) = open();
+    weighings(&mut db);
+
+    let found = rows(
+        &mut db,
+        "SELECT g.brinco, p.kg FROM gado g JOIN pesagem p ON p.gado_id = g.id",
+    );
+    assert_eq!(found.len(), 4, "the weighing of a cow that is gone drops out");
+
+    let ordered = rows(
+        &mut db,
+        "SELECT g.brinco, p.kg FROM gado g JOIN pesagem p ON p.gado_id = g.id ORDER BY p.kg DESC",
+    );
+    assert_eq!(ordered[0][0], Value::Text("BR-0003".into()));
+    assert_eq!(ordered[0][1], Value::Real(512.25));
+}
+
+#[test]
+fn an_equality_becomes_a_hash_join() {
+    let (_dir, mut db) = open();
+    weighings(&mut db);
+
+    // Rule 4: one side reads only the left input, the other only the right.
+    let plan = plan_of(
+        &mut db,
+        "SELECT g.brinco FROM gado g JOIN pesagem p ON p.gado_id = g.id",
+    );
+    assert!(plan.contains("HashJoin"), "{plan}");
+    assert!(plan.contains("build:") && plan.contains("probe:"), "{plan}");
+
+    // Anything else has to be checked pair by pair.
+    let plan = plan_of(
+        &mut db,
+        "SELECT g.brinco FROM gado g JOIN pesagem p ON p.kg > g.peso",
+    );
+    assert!(plan.contains("NestedLoopJoin"), "{plan}");
+}
+
+#[test]
+fn a_nested_loop_join_agrees_with_a_hash_join() {
+    let (_dir, mut db) = open();
+    weighings(&mut db);
+
+    let hashed = rows(
+        &mut db,
+        "SELECT g.id, p.id FROM gado g JOIN pesagem p ON p.gado_id = g.id ORDER BY p.id",
+    );
+    // The same pairing written so that no equality qualifies, which forces the
+    // other operator. Both must find exactly the same pairs.
+    let looped = rows(
+        &mut db,
+        "SELECT g.id, p.id FROM gado g JOIN pesagem p ON p.gado_id >= g.id AND p.gado_id <= g.id \
+         ORDER BY p.id",
+    );
+    assert_eq!(hashed, looped);
+}
+
+#[test]
+fn a_join_condition_may_carry_more_than_the_equality() {
+    let (_dir, mut db) = open();
+    weighings(&mut db);
+
+    let found = rows(
+        &mut db,
+        "SELECT p.id FROM gado g JOIN pesagem p ON p.gado_id = g.id AND p.kg > 400",
+    );
+    assert_eq!(found.len(), 3);
+
+    let plan = plan_of(
+        &mut db,
+        "SELECT p.id FROM gado g JOIN pesagem p ON p.gado_id = g.id AND p.kg > 400",
+    );
+    assert!(plan.contains("HashJoin"), "{plan}");
+    assert!(plan.contains("and ("), "the rest stays as a residual: {plan}");
+}
+
+#[test]
+fn a_null_join_key_matches_nothing() {
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER);
+         CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER);
+         INSERT INTO a VALUES (1, NULL), (2, 7);
+         INSERT INTO b VALUES (1, NULL), (2, 7);",
+    )
+    .unwrap();
+
+    // Two nulls are not equal to each other, so only the sevens pair up.
+    let found = rows(&mut db, "SELECT a.id, b.id FROM a JOIN b ON a.k = b.k");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0][0], Value::Int(2));
+}
+
+#[test]
+fn a_star_over_a_join_returns_both_sides() {
+    let (_dir, mut db) = open();
+    weighings(&mut db);
+
+    let outcome = db
+        .query("SELECT * FROM gado g JOIN pesagem p ON p.gado_id = g.id")
+        .unwrap();
+    let Outcome::Rows { columns, rows } = outcome else {
+        panic!()
+    };
+    assert_eq!(columns.len(), 7, "four columns plus three");
+    assert_eq!(rows[0].len(), 7);
+}
+
+#[test]
+fn an_ambiguous_column_is_refused_rather_than_guessed() {
+    let (_dir, mut db) = open();
+    weighings(&mut db);
+
+    // `id` names a column in both tables.
+    assert!(db
+        .query("SELECT id FROM gado g JOIN pesagem p ON p.gado_id = g.id")
+        .is_err());
+    // Qualified, it is unambiguous again.
+    assert!(db
+        .query("SELECT g.id FROM gado g JOIN pesagem p ON p.gado_id = g.id")
+        .is_ok());
+    // And a qualifier nobody declared is an error too.
+    assert!(db
+        .query("SELECT x.id FROM gado g JOIN pesagem p ON p.gado_id = g.id")
+        .is_err());
+}
+
+#[test]
+fn three_tables_join_left_deep() {
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, n INTEGER);
+         CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER);
+         CREATE TABLE c (id INTEGER PRIMARY KEY, b_id INTEGER);
+         INSERT INTO a VALUES (1, 10), (2, 20);
+         INSERT INTO b VALUES (1, 1), (2, 2);
+         INSERT INTO c VALUES (1, 1), (2, 1), (3, 2);",
+    )
+    .unwrap();
+
+    let found = rows(
+        &mut db,
+        "SELECT a.n, c.id FROM a JOIN b ON b.a_id = a.id JOIN c ON c.b_id = b.id ORDER BY c.id",
+    );
+    assert_eq!(found.len(), 3);
+    assert_eq!(found[0][0], Value::Int(10));
+    assert_eq!(found[2][0], Value::Int(20));
 }
