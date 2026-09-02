@@ -7,9 +7,10 @@
 //! - [`storage::page`] — the slotted page layout and the on-disk encodings
 //! - [`index::btree`] — an ordered map of bytes to bytes, over those pages
 //! - [`wal`] — the write-ahead log and ARIES recovery
+//! - [`sql`] — the lexer, the syntax tree and the parser
 //!
-//! Everything above (SQL, MVCC) is specified in `docs/` and not yet
-//! implemented. The specification is the contract; see `docs/en/02-file-format.md`
+//! What is left is the rest of the SQL layer and MVCC, both specified in
+//! `docs/` and not yet implemented. The specification is the contract; see `docs/en/02-file-format.md`
 //! for the binary layouts these modules implement.
 //!
 //! ```
@@ -56,6 +57,7 @@
 
 pub mod error;
 pub mod index;
+pub mod sql;
 pub mod storage;
 pub mod util;
 pub mod wal;
