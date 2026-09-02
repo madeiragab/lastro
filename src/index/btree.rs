@@ -36,7 +36,28 @@ pub struct BTree {
 
 impl BTree {
     /// Creates an empty tree: a single leaf, which is also the root.
+    ///
+    /// Logged like any other change, and it has to be. Setting up a page writes
+    /// its type, and nothing after that ever writes the type again — so if the
+    /// setup is not in the log, redo rebuilds the page's contents onto a page
+    /// that never learned what it is. That was a real bug, and the diary in the
+    /// README has it.
     pub fn create(pool: &mut BufferPool) -> Result<BTree> {
+        let mine = pool.begin_edit();
+        let outcome = BTree::create_unlogged(pool);
+        if outcome.is_err() {
+            if mine {
+                pool.abort_edit();
+            }
+            return outcome;
+        }
+        if mine {
+            pool.end_edit()?;
+        }
+        outcome
+    }
+
+    fn create_unlogged(pool: &mut BufferPool) -> Result<BTree> {
         let pin = pool.new_page(PageType::Leaf)?;
         let root = pin.page_id;
         pool.page_mut(&pin).set_root(true);
@@ -220,13 +241,17 @@ impl BTree {
     /// neither, the session is a no-op and the tree behaves exactly as before —
     /// which is what lets the same code serve both.
     pub fn insert(&mut self, pool: &mut BufferPool, key: &[u8], value: &[u8]) -> Result<()> {
-        pool.begin_edit();
+        let mine = pool.begin_edit();
         let outcome = self.insert_unlogged(pool, key, value);
         if outcome.is_err() {
-            pool.abort_edit();
+            if mine {
+                pool.abort_edit();
+            }
             return outcome;
         }
-        pool.end_edit()?;
+        if mine {
+            pool.end_edit()?;
+        }
         outcome
     }
 
@@ -285,13 +310,17 @@ impl BTree {
     ///
     /// Logged as one group, the same way [`BTree::insert`] is.
     pub fn delete(&mut self, pool: &mut BufferPool, key: &[u8]) -> Result<bool> {
-        pool.begin_edit();
+        let mine = pool.begin_edit();
         let outcome = self.delete_unlogged(pool, key);
         if outcome.is_err() {
-            pool.abort_edit();
+            if mine {
+                pool.abort_edit();
+            }
             return outcome;
         }
-        pool.end_edit()?;
+        if mine {
+            pool.end_edit()?;
+        }
         outcome
     }
 
@@ -349,10 +378,12 @@ impl BTree {
                     pin = pool.fetch(child)?;
                 }
                 other => {
+                    let found = pin.page_id;
                     pool.unpin(pin);
                     release(pool, path);
                     return Err(Error::MalformedFile(format!(
-                        "page type {other:?} found inside a btree"
+                        "page {found} has type {other:?}, reached from root {}",
+                        self.root
                     )));
                 }
             }

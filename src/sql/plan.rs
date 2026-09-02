@@ -311,10 +311,11 @@ fn plan_select(pool: &mut BufferPool, catalog: &Catalog, select: &ast::Select) -
             table: table.clone(),
         },
     };
-    let residual = match indexed {
-        Some((_, _, leftover)) => leftover,
-        None => residual,
-    };
+    // The predicate stays even when an index answers it. Index entries are
+    // not removed when a version is superseded, so an entry may name a row
+    // whose visible version no longer matches; re-checking above is what makes
+    // a stale entry harmless rather than wrong.
+    let _ = &indexed;
 
     // Rule 4, join selection. An equality with one side reading only the left
     // input and the other only the right is what a hash join needs; anything
