@@ -25,6 +25,7 @@ número só entra depois de medido.
 | Buffer pool com política clock | concluído |
 | B+Tree | concluído |
 | WAL: formato do registro, regra WAL, recovery ARIES | concluído |
+| B+Tree transacional sobre o log | concluído |
 | Crash fuzzer | não começado |
 | SQL (parser, planner, executor) | não começado |
 | MVCC / snapshot isolation | não começado |
@@ -183,6 +184,61 @@ o que explica por quê.
 ## Diário de bugs
 
 Registro dos erros que custaram caro, porque é a parte que de fato ensinou alguma coisa.
+
+### O redo que pulava tudo, em silêncio
+
+De longe o pior dos que apareceram até agora, porque não quebrava nada de forma visível.
+
+O checkpoint esvazia o log. Como o LSN é o próprio offset do registro no arquivo, esvaziar o
+arquivo fazia a numeração recomeçar do zero. Mas as páginas no disco continuam carregando o LSN
+com que foram carimbadas — números grandes, da vida anterior do log.
+
+Na fase de redo a comparação é `página.lsn < registro.lsn`, e ela existe justamente para pular o
+que a página já reflete. Com a numeração reiniciada, **toda** página parecia mais nova que
+**todo** registro. O redo pulava a transação inteira e reportava sucesso.
+
+O sintoma foi uma árvore com uma chave fora da faixa do nó, três camadas longe da causa. O que
+achou foi o `check_tree`, não um teste de comportamento — de novo.
+
+A correção usa o campo que a própria especificação já tinha reservado: o offset no arquivo passa
+a ser `lsn - base`, e a base fica em `last_checkpoint_lsn` na página de metadados. A numeração
+nunca reinicia; só o arquivo.
+
+### A página liberada que o redo ressuscitava
+
+Quando dois nós se fundem, a página que sobra é devolvida à freelist. Isso era feito escrevendo o
+cabeçalho de freelist direto no disco, fora do log.
+
+Depois de uma queda, o redo reaplicava os registros antigos daquela página — restaurando conteúdo
+de árvore por cima do cabeçalho de freelist. A cadeia de páginas livres passava a apontar para
+dentro de dados, e a alocação seguinte devolvia um número de página inventado.
+
+Agora a página só é liberada no checkpoint, quando o log está vazio e não existe mais nada para
+reaplicar sobre ela. Uma transação que aborta simplesmente não libera: a página vaza espaço, e
+isso está declarado como limitação em vez de disfarçado.
+
+### O contador de páginas que voltava no tempo
+
+`page_count` só era gravado no checkpoint. Depois de uma queda, o alocador voltava a entregar
+números de página que já tinham dados confirmados, e a transação seguinte escrevia por cima.
+
+O commit passa a sincronizar a página de metadados **antes** de gravar o registro de commit.
+Errar cedo é a direção segura: uma queda entre os dois deixa a transação para desfazer e os
+metadados apenas contando páginas a mais, o que vaza espaço em vez de perder dados.
+
+### O intervalo único que cobria a página inteira
+
+Menos grave, mas instrutivo. O log grava a menor diferença entre a imagem anterior e a nova da
+página. Com um intervalo contíguo só, isso é péssimo para slotted page: slots crescem da frente,
+células crescem do fim, então quase qualquer alteração toca as duas pontas e o intervalo mínimo
+cobre os 4096 bytes.
+
+Medido: 4359 bytes de log para uma inserção de 200 bytes — pior que simplesmente gravar a página
+inteira. Cortar o diff em trechos separados, unindo os que estão perto demais para valer um
+registro próprio, derrubou isso para menos de 1500.
+
+O que ensina: "grave só o que mudou" só é barato se você souber **onde** mudou. Em uma estrutura
+que cresce pelas duas pontas, um intervalo não é a resposta.
 
 ### A invariante que estava errada duas vezes
 

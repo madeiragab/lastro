@@ -36,8 +36,23 @@ pub fn checkpoint(pool: &mut BufferPool) -> Result<()> {
     // Writes every dirty page and syncs the data file. Each write consults the
     // log first, through the WAL rule in the buffer pool's eviction path.
     pool.flush_all()?;
-    if let Some(wal) = pool.wal_mut() {
-        wal.checkpoint_truncate()?;
+    let base = match pool.wal_mut() {
+        Some(wal) => {
+            wal.checkpoint_truncate()?;
+            Some(wal.base_lsn())
+        }
+        None => None,
+    };
+    // The numbering continues across the truncation, and where it continues
+    // from has to be durable: a log that restarted at zero would look older
+    // than every page on disk, and redo would skip all of it in silence.
+    if let Some(base) = base {
+        pool.pager_mut().meta_mut().last_checkpoint_lsn = base;
     }
+    // Only now, with the log empty, is it safe to write freelist headers over
+    // the pages committed transactions gave up: nothing is left to replay on
+    // top of them.
+    pool.release_pending_frees()?;
+    pool.pager_mut().sync()?;
     Ok(())
 }

@@ -58,6 +58,13 @@ pub enum Error {
     /// A logged write was asked for on a pool with no log attached.
     NoLogAttached,
 
+    /// A transaction was started while another was already open. The engine
+    /// is single-writer; see `docs/en/adr.md`, ADR-003.
+    TransactionAlreadyOpen,
+
+    /// A commit or rollback was asked for with no transaction open.
+    NoOpenTransaction,
+
     /// A key could not be encoded; currently only `NaN`.
     InvalidKey(&'static str),
 }
@@ -93,6 +100,13 @@ impl fmt::Display for Error {
             Error::PageStillPinned(p) => write!(f, "page {p} is still pinned elsewhere"),
             Error::CannotFreeMetaPage => write!(f, "the metadata page cannot be freed"),
             Error::NoLogAttached => write!(f, "no write-ahead log is attached to this pool"),
+            Error::TransactionAlreadyOpen => {
+                write!(
+                    f,
+                    "a transaction is already open; the engine is single-writer"
+                )
+            }
+            Error::NoOpenTransaction => write!(f, "no transaction is open"),
             Error::InvalidKey(why) => write!(f, "invalid key: {why}"),
         }
     }
