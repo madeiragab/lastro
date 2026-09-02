@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use crate::index::BTree;
-use crate::sql::catalog::Catalog;
+use crate::sql::catalog::{Catalog, IndexSchema};
 use crate::sql::exec::{self, Row};
 use crate::sql::plan::{plan, Plan};
 use crate::sql::{ast, parse_many};
@@ -187,10 +187,42 @@ impl Database {
                 let tree = BTree::create(&mut self.pool)?;
                 schema.root = tree.root();
 
+                // A column declared UNIQUE is a request for an index, so one is
+                // built rather than the constraint being recorded and forgotten.
+                let unique: Vec<usize> = schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, column)| column.unique && !column.primary_key)
+                    .map(|(index, _)| index)
+                    .collect();
+                for position in unique {
+                    let index_tree = BTree::create(&mut self.pool)?;
+                    schema.indexes.push(IndexSchema {
+                        name: format!("{}_{}_unique", schema.name, schema.columns[position].name),
+                        root: index_tree.root(),
+                        unique: true,
+                        columns: vec![position],
+                    });
+                }
+
                 let mut catalog = self.catalog;
                 catalog.put(&mut self.pool, &schema)?;
                 self.catalog = catalog;
                 Ok(Outcome::Ack)
+            }
+            Plan::CreateIndex { mut table, index } => {
+                let tree = BTree::create(&mut self.pool)?;
+                let mut index = index;
+                index.root = tree.root();
+
+                let built = exec::build_index(&mut self.pool, &table, &index)?;
+                table.indexes.push(index);
+
+                let mut catalog = self.catalog;
+                catalog.put(&mut self.pool, &table)?;
+                self.catalog = catalog;
+                Ok(Outcome::Affected(built))
             }
             Plan::Insert {
                 table,

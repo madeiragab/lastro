@@ -563,7 +563,11 @@ fn a_join_pairs_the_rows_that_match() {
         &mut db,
         "SELECT g.brinco, p.kg FROM gado g JOIN pesagem p ON p.gado_id = g.id",
     );
-    assert_eq!(found.len(), 4, "the weighing of a cow that is gone drops out");
+    assert_eq!(
+        found.len(),
+        4,
+        "the weighing of a cow that is gone drops out"
+    );
 
     let ordered = rows(
         &mut db,
@@ -629,7 +633,10 @@ fn a_join_condition_may_carry_more_than_the_equality() {
         "SELECT p.id FROM gado g JOIN pesagem p ON p.gado_id = g.id AND p.kg > 400",
     );
     assert!(plan.contains("HashJoin"), "{plan}");
-    assert!(plan.contains("and ("), "the rest stays as a residual: {plan}");
+    assert!(
+        plan.contains("and ("),
+        "the rest stays as a residual: {plan}"
+    );
 }
 
 #[test]
@@ -703,4 +710,155 @@ fn three_tables_join_left_deep() {
     assert_eq!(found.len(), 3);
     assert_eq!(found[0][0], Value::Int(10));
     assert_eq!(found[2][0], Value::Int(20));
+}
+
+// -- secondary indexes -----------------------------------------------------
+
+#[test]
+fn an_index_turns_an_equality_into_a_lookup() {
+    let (_dir, mut db) = open();
+    herd(&mut db);
+
+    // Without an index the only way through is a scan.
+    let plan = plan_of(&mut db, "SELECT * FROM gado WHERE brinco = 'BR-0003'");
+    assert!(plan.contains("SeqScan"), "{plan}");
+
+    db.query("CREATE INDEX idx_brinco ON gado (brinco)")
+        .unwrap();
+
+    let plan = plan_of(&mut db, "SELECT * FROM gado WHERE brinco = 'BR-0003'");
+    assert!(plan.contains("IndexScan gado using idx_brinco"), "{plan}");
+    assert!(!plan.contains("SeqScan"), "{plan}");
+
+    let found = rows(&mut db, "SELECT id FROM gado WHERE brinco = 'BR-0003'");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0][0], Value::Int(3));
+}
+
+#[test]
+fn an_index_is_built_over_the_rows_already_there_and_kept_up_to_date() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cor TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'preto'), (2, 'branco'), (3, 'preto')")
+        .unwrap();
+
+    assert_eq!(
+        db.query("CREATE INDEX idx_cor ON t (cor)").unwrap(),
+        Outcome::Affected(3),
+        "the index is built over what is already there"
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT id FROM t WHERE cor = 'preto'").len(),
+        2
+    );
+
+    // And every later write keeps it in step.
+    db.execute("INSERT INTO t VALUES (4, 'preto')").unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT id FROM t WHERE cor = 'preto'").len(),
+        3
+    );
+
+    db.query("UPDATE t SET cor = 'branco' WHERE id = 1")
+        .unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT id FROM t WHERE cor = 'preto'").len(),
+        2
+    );
+    assert_eq!(
+        rows(&mut db, "SELECT id FROM t WHERE cor = 'branco'").len(),
+        2
+    );
+
+    db.query("DELETE FROM t WHERE id = 3").unwrap();
+    assert_eq!(
+        rows(&mut db, "SELECT id FROM t WHERE cor = 'preto'").len(),
+        1
+    );
+}
+
+#[test]
+fn an_index_and_a_scan_agree() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    db.execute("BEGIN").unwrap();
+    for id in 1..=400i64 {
+        db.execute(&format!("INSERT INTO t VALUES ({id}, {})", id % 7))
+            .unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+
+    let scanned = rows(&mut db, "SELECT id FROM t WHERE n = 3 ORDER BY id");
+    db.query("CREATE INDEX idx_n ON t (n)").unwrap();
+    let looked_up = rows(&mut db, "SELECT id FROM t WHERE n = 3 ORDER BY id");
+
+    assert_eq!(scanned, looked_up);
+    assert!(!scanned.is_empty());
+}
+
+#[test]
+fn a_unique_index_refuses_a_second_copy() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cpf TEXT UNIQUE)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '111')").unwrap();
+
+    assert!(db.query("INSERT INTO t VALUES (2, '111')").is_err());
+    assert!(db.query("INSERT INTO t VALUES (2, '222')").is_ok());
+    assert!(db.query("UPDATE t SET cpf = '111' WHERE id = 2").is_err());
+
+    // A null is not equal to anything, not even another null, so any number of
+    // them fit in a unique index.
+    assert!(db.query("INSERT INTO t VALUES (3, NULL)").is_ok());
+    assert!(db.query("INSERT INTO t VALUES (4, NULL)").is_ok());
+    assert_eq!(rows(&mut db, "SELECT id FROM t").len(), 4);
+}
+
+#[test]
+fn building_a_unique_index_over_duplicates_is_refused() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cor TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'preto'), (2, 'preto')")
+        .unwrap();
+    assert!(db.query("CREATE UNIQUE INDEX i ON t (cor)").is_err());
+}
+
+#[test]
+fn indexes_survive_a_crash_and_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("indexed.lastro");
+
+    {
+        let mut db = Database::open(&path).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cor TEXT)")
+            .unwrap();
+        db.execute("BEGIN").unwrap();
+        for id in 1..=300i64 {
+            db.execute(&format!("INSERT INTO t VALUES ({id}, 'c{}')", id % 10))
+                .unwrap();
+        }
+        db.execute("COMMIT").unwrap();
+        db.query("CREATE INDEX idx_cor ON t (cor)").unwrap();
+    }
+
+    let mut db = Database::open(&path).unwrap();
+    let plan = plan_of(&mut db, "SELECT * FROM t WHERE cor = 'c3'");
+    assert!(plan.contains("IndexScan"), "the index survived: {plan}");
+    assert_eq!(rows(&mut db, "SELECT id FROM t WHERE cor = 'c3'").len(), 30);
+}
+
+#[test]
+fn an_index_on_a_column_that_does_not_exist_is_refused() {
+    let (_dir, mut db) = open();
+    herd(&mut db);
+    assert!(db.query("CREATE INDEX i ON gado (ausente)").is_err());
+    assert!(db.query("CREATE INDEX i ON ausente (brinco)").is_err());
+    db.query("CREATE INDEX i ON gado (brinco)").unwrap();
+    assert!(
+        db.query("CREATE INDEX i ON gado (peso)").is_err(),
+        "duplicate name"
+    );
 }

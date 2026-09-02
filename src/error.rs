@@ -86,6 +86,9 @@ pub enum Error {
     /// A null was written into a column that refuses them.
     NotNull(String),
 
+    /// A value was written twice into an index that admits it once.
+    NotUnique(String),
+
     /// A value does not fit the column it was written to.
     TypeMismatch {
         /// The column that refused it.
@@ -153,6 +156,7 @@ impl fmt::Display for Error {
             Error::Unsupported(what) => write!(f, "not supported: {what}"),
             Error::TableExists(name) => write!(f, "a table called {name} already exists"),
             Error::NotNull(column) => write!(f, "{column} does not accept NULL"),
+            Error::NotUnique(index) => write!(f, "{index} already holds that value"),
             Error::TypeMismatch {
                 column,
                 wanted,
