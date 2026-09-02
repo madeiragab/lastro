@@ -67,6 +67,15 @@ pub enum Error {
 
     /// A key could not be encoded; currently only `NaN`.
     InvalidKey(&'static str),
+
+    /// A statement could not be read.
+    Sql {
+        /// What went wrong.
+        message: String,
+        /// The byte offset in the statement where it went wrong, so a caller
+        /// can point at the place rather than at the statement.
+        at: usize,
+    },
 }
 
 impl fmt::Display for Error {
@@ -108,6 +117,7 @@ impl fmt::Display for Error {
             }
             Error::NoOpenTransaction => write!(f, "no transaction is open"),
             Error::InvalidKey(why) => write!(f, "invalid key: {why}"),
+            Error::Sql { message, at } => write!(f, "{message}, at offset {at}"),
         }
     }
 }

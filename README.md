@@ -28,7 +28,8 @@ número só entra depois de medido.
 | WAL: formato do registro, regra WAL, recovery ARIES | concluído |
 | B+Tree transacional sobre o log | concluído |
 | Crash fuzzer | concluído |
-| SQL (parser, planner, executor) | não começado |
+| SQL: lexer, árvore sintática, parser | concluído |
+| SQL: binder, catálogo, planner, executor | não começado |
 | MVCC / snapshot isolation | não começado |
 | Suíte de provas | parcial: modelo e propriedade prontos, crash fuzzer não |
 
