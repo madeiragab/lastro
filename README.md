@@ -29,22 +29,24 @@ número só entra depois de medido.
 | B+Tree transacional sobre o log | concluído |
 | Crash fuzzer | concluído |
 | SQL: lexer, árvore sintática, parser | concluído |
-| SQL: catálogo, binder, planner, executor | concluído para uma tabela |
-| SQL: junções, índices secundários, UPDATE, DELETE | não começado |
+| SQL: catálogo, binder, planner, executor | concluído |
+| SQL: junções, índices secundários, UPDATE, DELETE | concluído |
 | MVCC / snapshot isolation | não começado |
 | Suíte de provas | parcial: modelo e propriedade prontos, crash fuzzer não |
 
 O que já roda: criar e abrir um arquivo `.lastro`, alocar e liberar páginas com reuso pela
 freelist, guardar células de tamanho variável em slotted pages com compactação, um índice B+Tree
-com split e fusão sobre isso, e um write-ahead log com recovery ARIES completo — uma transação
-confirmada sobrevive a uma queda que perdeu a página, e uma não confirmada é desfeita mesmo que
-a página já tenha chegado ao disco.
+com split e fusão sobre isso, um write-ahead log com recovery ARIES completo, e uma camada SQL
+com `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT` com junções, `UPDATE`, `DELETE` e
+`EXPLAIN`.
 
-A regra WAL está no caminho de despejo do buffer pool: nenhuma página suja vai ao disco antes do
-registro que a descreve. É uma linha de código, e é a diferença entre um banco de dados e um
-arquivo que às vezes tem seus dados.
+Uma transação confirmada sobrevive a uma queda que perdeu a página, e uma não confirmada é
+desfeita mesmo que a página já tenha chegado ao disco. A regra WAL está no caminho de despejo do
+buffer pool: nenhuma página suja vai ao disco antes do registro que a descreve. É uma linha de
+código, e é a diferença entre um banco de dados e um arquivo que às vezes tem seus dados.
 
-Sem dependência nenhuma na biblioteca: CRC32C, varint e as codificações são escritos aqui.
+Uma dependência só na biblioteca, `tempfile`, e apenas porque um sort externo precisa de algum
+lugar para os runs. CRC32C, varint e todas as codificações são escritos aqui.
 
 ---
 
@@ -172,6 +174,30 @@ cargo run --bin lastro-cli -- pages exemplo.lastro
 ```bash
 cargo run --bin lastro-cli -- page exemplo.lastro 1
 ```
+
+---
+
+### O que o planner faz, e o que não faz
+
+Das seis regras da especificação, cinco estão implementadas e visíveis no `EXPLAIN`:
+
+| Regra | Estado |
+|---|---|
+| 1 · Escolha de acesso | ✅ faixa de row id, e igualdade na coluna líder de um índice |
+| 2 · Empurrar o predicado | ✅ o que a faixa não expressa fica como filtro |
+| 3 · Empurrar a projeção | não se aplica |
+| 4 · Escolha de junção | ✅ hash quando a igualdade separa os lados, laço aninhado senão |
+| 5 · Eliminar ordenação | ✅ quando a ordem pedida é a da chave primária ascendente |
+| 6 · Empurrar o limite | ✅ `LIMIT` sobre `Sort` vira top-N, contando o `OFFSET` |
+
+A regra 3 não é "não feita", é **sem efeito nesta representação**: uma linha é a tupla inteira da
+tabela, decodificada pelo scan. Não existe nada que uma projeção acima possa fazer para o scan
+ler menos, sem um layout colunar ou um índice de cobertura. Está registrada assim em vez de
+listada como pendente.
+
+Faixa sobre índice secundário — `WHERE peso > 400` com índice em `peso` — também fica de fora, e
+por um motivo específico: acertar as bordas de uma faixa sobre chave composta é exatamente o tipo
+de detalhe que fica errado em silêncio. Igualdade é correta e verificável; faixa espera.
 
 ---
 
