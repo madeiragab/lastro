@@ -7,10 +7,10 @@
 //! - [`storage::page`] — the slotted page layout and the on-disk encodings
 //! - [`index::btree`] — an ordered map of bytes to bytes, over those pages
 //! - [`wal`] — the write-ahead log and ARIES recovery
-//! - [`sql`] — the lexer, the syntax tree and the parser
+//! - [`sql`] — the parser, the catalog, the planner and the executor
 //!
-//! What is left is the rest of the SQL layer and MVCC, both specified in
-//! `docs/` and not yet implemented. The specification is the contract; see `docs/en/02-file-format.md`
+//! What is left is joins, secondary indexes, `UPDATE`, `DELETE` and MVCC, all
+//! specified in `docs/` and not yet implemented. The specification is the contract; see `docs/en/02-file-format.md`
 //! for the binary layouts these modules implement.
 //!
 //! ```
@@ -53,6 +53,30 @@
 //! assert_eq!(window.len(), 100);
 //!
 //! tree.check_tree(&mut pool).unwrap();
+//! ```
+//!
+//! And the whole thing, from text to rows:
+//!
+//! ```
+//! use lastro::sql::{Database, Outcome};
+//!
+//! let dir = tempfile::tempdir().unwrap();
+//! let mut db = Database::open(dir.path().join("rebanho.lastro")).unwrap();
+//!
+//! db.execute("
+//!     CREATE TABLE gado (id INTEGER PRIMARY KEY, brinco TEXT NOT NULL, peso REAL);
+//!     INSERT INTO gado VALUES (1, 'BR-0042', 431.5), (2, 'BR-0043', 380.0);
+//! ").unwrap();
+//!
+//! let outcome = db.query("SELECT brinco FROM gado WHERE peso > 400").unwrap();
+//! let Outcome::Rows { rows, .. } = outcome else { panic!() };
+//! assert_eq!(rows.len(), 1);
+//!
+//! // A predicate on the primary key becomes a descent rather than a scan, and
+//! // EXPLAIN is where that becomes visible.
+//! let Outcome::Plan(plan) = db.query("EXPLAIN SELECT * FROM gado WHERE id = 1").unwrap()
+//! else { panic!() };
+//! assert!(plan.contains("RowIdScan gado (= 1)"), "{plan}");
 //! ```
 
 pub mod error;

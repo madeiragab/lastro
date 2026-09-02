@@ -68,6 +68,31 @@ pub enum Error {
     /// A key could not be encoded; currently only `NaN`.
     InvalidKey(&'static str),
 
+    /// A statement names a table that does not exist.
+    UnknownTable(String),
+
+    /// A statement names a column that does not exist.
+    UnknownColumn(String),
+
+    /// A statement asks for something this build does not do yet.
+    Unsupported(String),
+
+    /// `CREATE TABLE` on a name that is already taken.
+    TableExists(String),
+
+    /// A null was written into a column that refuses them.
+    NotNull(String),
+
+    /// A value does not fit the column it was written to.
+    TypeMismatch {
+        /// The column that refused it.
+        column: String,
+        /// What the column holds.
+        wanted: &'static str,
+        /// What was offered.
+        found: &'static str,
+    },
+
     /// A statement could not be read.
     Sql {
         /// What went wrong.
@@ -117,6 +142,16 @@ impl fmt::Display for Error {
             }
             Error::NoOpenTransaction => write!(f, "no transaction is open"),
             Error::InvalidKey(why) => write!(f, "invalid key: {why}"),
+            Error::UnknownTable(name) => write!(f, "there is no table called {name}"),
+            Error::UnknownColumn(name) => write!(f, "there is no column called {name}"),
+            Error::Unsupported(what) => write!(f, "not supported: {what}"),
+            Error::TableExists(name) => write!(f, "a table called {name} already exists"),
+            Error::NotNull(column) => write!(f, "{column} does not accept NULL"),
+            Error::TypeMismatch {
+                column,
+                wanted,
+                found,
+            } => write!(f, "{column} holds {wanted} but was given {found}"),
             Error::Sql { message, at } => write!(f, "{message}, at offset {at}"),
         }
     }
