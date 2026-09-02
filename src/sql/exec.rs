@@ -7,13 +7,16 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 
 use crate::index::{BTree, Cursor};
 use crate::sql::ast::{BinaryOp, DataType, UnaryOp};
 use crate::sql::catalog::{IndexSchema, TableSchema};
 use crate::sql::plan::{Bound, Plan, PlanExpr};
 use crate::storage::page::encoding::{
-    decode_i64, decode_tuple, encode_i64, encode_key, encode_tuple, Value, ValueType,
+    decode_i64, decode_tuple, encode_i64, encode_key, encode_tuple, get_varint, put_varint, Value,
+    ValueType,
 };
 use crate::storage::BufferPool;
 use crate::{Error, Result};
@@ -253,6 +256,185 @@ fn overflow(what: &str) -> Error {
     Error::Unsupported(format!("{what} overflowed a 64 bit integer"))
 }
 
+// -- spilling --------------------------------------------------------------
+
+/// How many rows a sort keeps in memory before it starts writing runs out.
+///
+/// Everything else in the executor streams; a sort cannot, because it has to
+/// see the last row before it knows which one comes first. What it can do is
+/// bound what it holds, which is what this is for.
+pub const DEFAULT_SORT_ROWS: usize = 8192;
+
+/// A row written in a form that carries its own types.
+///
+/// The tuple encoding is flat and needs a schema to read back. A sort may sit
+/// over a join, where the row is two schemas laid end to end, so the spill
+/// format tags each value instead of asking anybody to remember.
+fn spill_row(row: &[Value], out: &mut Vec<u8>) {
+    let start = out.len();
+    out.extend_from_slice(&[0u8; 4]);
+    put_varint(out, row.len() as u64);
+    for value in row {
+        match value {
+            Value::Null => out.push(0),
+            Value::Int(number) => {
+                out.push(1);
+                out.extend_from_slice(&number.to_le_bytes());
+            }
+            Value::Real(number) => {
+                out.push(2);
+                out.extend_from_slice(&number.to_le_bytes());
+            }
+            Value::Text(text) => {
+                out.push(3);
+                put_varint(out, text.len() as u64);
+                out.extend_from_slice(text.as_bytes());
+            }
+            Value::Blob(bytes) => {
+                out.push(4);
+                put_varint(out, bytes.len() as u64);
+                out.extend_from_slice(bytes);
+            }
+            Value::Bool(flag) => {
+                out.push(5);
+                out.push(u8::from(*flag));
+            }
+        }
+    }
+    let length = (out.len() - start - 4) as u32;
+    out[start..start + 4].copy_from_slice(&length.to_le_bytes());
+}
+
+fn unspill_row(input: &[u8]) -> Option<Row> {
+    let (count, mut at) = get_varint(input)?;
+    let mut row = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let tag = *input.get(at)?;
+        at += 1;
+        let value = match tag {
+            0 => Value::Null,
+            1 => {
+                let bytes = input.get(at..at + 8)?;
+                at += 8;
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(bytes);
+                Value::Int(i64::from_le_bytes(buf))
+            }
+            2 => {
+                let bytes = input.get(at..at + 8)?;
+                at += 8;
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(bytes);
+                Value::Real(f64::from_le_bytes(buf))
+            }
+            3 | 4 => {
+                let (length, read) = get_varint(input.get(at..)?)?;
+                at += read;
+                let bytes = input.get(at..at + length as usize)?;
+                at += length as usize;
+                if tag == 3 {
+                    Value::Text(String::from_utf8(bytes.to_vec()).ok()?)
+                } else {
+                    Value::Blob(bytes.to_vec())
+                }
+            }
+            5 => {
+                let byte = *input.get(at)?;
+                at += 1;
+                Value::Bool(byte != 0)
+            }
+            _ => return None,
+        };
+        row.push(value);
+    }
+    Some(row)
+}
+
+/// A batch of sorted rows, written out so the sort can let go of them.
+#[derive(Debug)]
+pub struct SortedRun {
+    file: BufReader<File>,
+    next: Option<Row>,
+}
+
+impl SortedRun {
+    /// Writes a sorted batch to a temporary file and reopens it for reading.
+    fn spill(rows: &[Row]) -> Result<SortedRun> {
+        let mut file = tempfile::tempfile()?;
+        let mut buffer = Vec::new();
+        for row in rows {
+            spill_row(row, &mut buffer);
+            if buffer.len() >= 1 << 16 {
+                file.write_all(&buffer)?;
+                buffer.clear();
+            }
+        }
+        file.write_all(&buffer)?;
+        file.seek(SeekFrom::Start(0))?;
+
+        let mut run = SortedRun {
+            file: BufReader::new(file),
+            next: None,
+        };
+        run.advance()?;
+        Ok(run)
+    }
+
+    /// The row at the front of the run, without consuming it.
+    fn peek(&self) -> Option<&Row> {
+        self.next.as_ref()
+    }
+
+    /// Takes the front row and reads the one behind it.
+    fn take(&mut self) -> Result<Option<Row>> {
+        let row = self.next.take();
+        self.advance()?;
+        Ok(row)
+    }
+
+    fn advance(&mut self) -> Result<()> {
+        let mut header = [0u8; 4];
+        match self.file.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                self.next = None;
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let length = u32::from_le_bytes(header) as usize;
+        let mut body = vec![0u8; length];
+        self.file.read_exact(&mut body)?;
+        self.next =
+            Some(unspill_row(&body).ok_or_else(|| {
+                Error::MalformedFile("a spilled row that does not decode".into())
+            })?);
+        Ok(())
+    }
+}
+
+/// Orders two rows by a sort key list.
+fn compare_rows(keys: &[(PlanExpr, bool)], left: &Row, right: &Row) -> Result<Ordering> {
+    for (expr, descending) in keys {
+        let a = eval(expr, left)?;
+        let b = eval(expr, right)?;
+        let ordering = match compare(&a, &b) {
+            Some(ordering) => ordering,
+            // Nulls sort before everything, the same way they do in an encoded
+            // key.
+            None => null_order(&a, &b),
+        };
+        if ordering != Ordering::Equal {
+            return Ok(if *descending {
+                ordering.reverse()
+            } else {
+                ordering
+            });
+        }
+    }
+    Ok(Ordering::Equal)
+}
+
 // -- operators -------------------------------------------------------------
 
 /// A running operator.
@@ -289,6 +471,11 @@ pub enum Op {
         exprs: Vec<PlanExpr>,
     },
     /// Orders rows. The only operator that has to see everything first.
+    ///
+    /// It holds at most `budget` rows: past that it sorts what it has, writes
+    /// the batch out as a run, and starts again. At the end the runs are merged
+    /// k ways. So a sort over more rows than fit still runs, in memory bounded
+    /// by the budget rather than by the input.
     Sort {
         /// Where rows come from.
         input: Box<Op>,
@@ -296,8 +483,16 @@ pub enum Op {
         keys: Vec<(PlanExpr, bool)>,
         /// How many rows are wanted, when a limit sits above.
         top: Option<usize>,
-        /// The sorted rows, once the input has been drained.
+        /// How many rows to hold before writing a run out.
+        budget: usize,
+        /// Runs written out, each already in order.
+        runs: Vec<SortedRun>,
+        /// The sorted rows, when everything fitted in memory.
         buffered: Option<std::vec::IntoIter<Row>>,
+        /// How many rows the merge has yielded, for the top-n cutoff.
+        yielded: usize,
+        /// Whether the input has been read to the end.
+        drained: bool,
     },
     /// Pairs every outer row with every inner row, keeping what the condition
     /// admits.
@@ -407,49 +602,71 @@ impl Op {
                 input,
                 keys,
                 top,
+                budget,
+                runs,
                 buffered,
+                yielded,
+                drained,
             } => {
-                if buffered.is_none() {
-                    let mut rows = Vec::new();
+                if !*drained {
+                    let mut batch: Vec<Row> = Vec::new();
                     while let Some(row) = input.next(pool)? {
-                        rows.push(row);
+                        batch.push(row);
+                        if batch.len() >= *budget {
+                            sort_batch(keys, &mut batch)?;
+                            runs.push(SortedRun::spill(&batch)?);
+                            batch.clear();
+                        }
                     }
+                    sort_batch(keys, &mut batch)?;
 
-                    let mut failure = None;
-                    rows.sort_by(|left, right| {
-                        for (expr, descending) in keys.iter() {
-                            let ordering = match (eval(expr, left), eval(expr, right)) {
-                                (Ok(a), Ok(b)) => match compare(&a, &b) {
-                                    Some(ordering) => ordering,
-                                    // Nulls sort before everything, the same
-                                    // way they do in an encoded key.
-                                    None => null_order(&a, &b),
-                                },
-                                (Err(error), _) | (_, Err(error)) => {
-                                    failure.get_or_insert(error);
-                                    Ordering::Equal
-                                }
-                            };
-                            if ordering != Ordering::Equal {
-                                return if *descending {
-                                    ordering.reverse()
-                                } else {
-                                    ordering
-                                };
+                    if runs.is_empty() {
+                        // Everything fitted, so there is nothing to merge.
+                        if let Some(limit) = top {
+                            batch.truncate(*limit);
+                        }
+                        *buffered = Some(batch.into_iter());
+                    } else if !batch.is_empty() {
+                        runs.push(SortedRun::spill(&batch)?);
+                    }
+                    *drained = true;
+                }
+
+                if let Some(rows) = buffered.as_mut() {
+                    return Ok(rows.next());
+                }
+                if let Some(limit) = top {
+                    if *yielded >= *limit {
+                        return Ok(None);
+                    }
+                }
+
+                // A k way merge over the runs: whichever run has the smallest
+                // front row gives it up, and reads the one behind it.
+                let mut best: Option<usize> = None;
+                for index in 0..runs.len() {
+                    let Some(candidate) = runs[index].peek() else {
+                        continue;
+                    };
+                    match best {
+                        None => best = Some(index),
+                        Some(current) => {
+                            let incumbent =
+                                runs[current].peek().expect("chosen because it had one");
+                            if compare_rows(keys, candidate, incumbent)? == Ordering::Less {
+                                best = Some(index);
                             }
                         }
-                        Ordering::Equal
-                    });
-                    if let Some(error) = failure {
-                        return Err(error);
                     }
-
-                    if let Some(limit) = top {
-                        rows.truncate(*limit);
-                    }
-                    *buffered = Some(rows.into_iter());
                 }
-                Ok(buffered.as_mut().expect("filled above").next())
+
+                match best {
+                    Some(index) => {
+                        *yielded += 1;
+                        runs[index].take()
+                    }
+                    None => Ok(None),
+                }
             }
 
             Op::NestedLoopJoin {
@@ -580,8 +797,30 @@ fn null_order(left: &Value, right: &Value) -> Ordering {
     }
 }
 
+/// Sorts a batch, reporting the first evaluation failure rather than swallowing
+/// it inside the comparator.
+fn sort_batch(keys: &[(PlanExpr, bool)], rows: &mut [Row]) -> Result<()> {
+    let mut failure = None;
+    rows.sort_by(|left, right| match compare_rows(keys, left, right) {
+        Ok(ordering) => ordering,
+        Err(error) => {
+            failure.get_or_insert(error);
+            Ordering::Equal
+        }
+    });
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
 /// Builds the running operator tree from a plan.
 pub fn build(plan: &Plan, pool: &mut BufferPool) -> Result<Op> {
+    build_with(plan, pool, DEFAULT_SORT_ROWS)
+}
+
+/// Builds the tree with a given sort budget, in rows.
+pub fn build_with(plan: &Plan, pool: &mut BufferPool, budget: usize) -> Result<Op> {
     Ok(match plan {
         Plan::SeqScan { table } => Op::Scan {
             types: column_types(table),
@@ -603,13 +842,13 @@ pub fn build(plan: &Plan, pool: &mut BufferPool) -> Result<Op> {
             }
         }
         Plan::NestedLoopJoin { left, right, on } => {
-            let mut inner = build(right, pool)?;
+            let mut inner = build_with(right, pool, budget)?;
             let mut rows = Vec::new();
             while let Some(row) = inner.next(pool)? {
                 rows.push(row);
             }
             Op::NestedLoopJoin {
-                left: Box::new(build(left, pool)?),
+                left: Box::new(build_with(left, pool, budget)?),
                 right: rows,
                 on: on.clone(),
                 current: None,
@@ -623,8 +862,8 @@ pub fn build(plan: &Plan, pool: &mut BufferPool) -> Result<Op> {
             right_key,
             residual,
         } => Op::HashJoin {
-            left: Box::new(build(left, pool)?),
-            right: Box::new(build(right, pool)?),
+            left: Box::new(build_with(left, pool, budget)?),
+            right: Box::new(build_with(right, pool, budget)?),
             left_key: left_key.clone(),
             right_key: right_key.clone(),
             residual: residual.clone(),
@@ -645,25 +884,29 @@ pub fn build(plan: &Plan, pool: &mut BufferPool) -> Result<Op> {
             }
         }
         Plan::Filter { input, predicate } => Op::Filter {
-            input: Box::new(build(input, pool)?),
+            input: Box::new(build_with(input, pool, budget)?),
             predicate: predicate.clone(),
         },
         Plan::Project { input, exprs, .. } => Op::Project {
-            input: Box::new(build(input, pool)?),
+            input: Box::new(build_with(input, pool, budget)?),
             exprs: exprs.clone(),
         },
         Plan::Sort { input, keys, top } => Op::Sort {
-            input: Box::new(build(input, pool)?),
+            input: Box::new(build_with(input, pool, budget)?),
             keys: keys.clone(),
             top: *top,
+            budget: budget.max(1),
+            runs: Vec::new(),
             buffered: None,
+            yielded: 0,
+            drained: false,
         },
         Plan::Limit {
             input,
             limit,
             offset,
         } => Op::Limit {
-            input: Box::new(build(input, pool)?),
+            input: Box::new(build_with(input, pool, budget)?),
             remaining: *limit,
             skip: *offset,
         },
