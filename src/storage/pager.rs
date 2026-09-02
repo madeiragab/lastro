@@ -486,8 +486,9 @@ fn get_u64(bytes: &[u8], offset: usize) -> u64 {
 
 // -- positional I/O --------------------------------------------------------
 //
-// `pread`/`pwrite` on Unix, `seek_read`/`seek_write` on Windows. Both take the
-// offset as an argument, so the pager never owns a file cursor.
+// `pread`/`pwrite` on Unix, `seek_read`/`seek_write` on Windows, and the same
+// pair again under WASI, which is how the engine runs in a browser. All of them
+// take the offset as an argument, so the pager never owns a file cursor.
 
 #[cfg(unix)]
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
@@ -499,6 +500,29 @@ fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
 fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     use std::os::unix::fs::FileExt;
     file.write_all_at(buf, offset)
+}
+
+// WASI does have `pread`/`pwrite`, but the standard library keeps them behind
+// an unstable feature, so this build seeks and then reads. That is safe here
+// and would not be elsewhere: the browser runs one thread, and every call seeks
+// immediately before it transfers, so no other caller can move the cursor in
+// between. On a threaded host it would be a race, which is exactly why the
+// other two platforms do not do it this way.
+
+#[cfg(target_os = "wasi")]
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut handle = file;
+    handle.seek(SeekFrom::Start(offset))?;
+    handle.read_exact(buf)
+}
+
+#[cfg(target_os = "wasi")]
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut handle = file;
+    handle.seek(SeekFrom::Start(offset))?;
+    handle.write_all(buf)
 }
 
 #[cfg(windows)]

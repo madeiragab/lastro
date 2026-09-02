@@ -1,0 +1,280 @@
+/* One page, two themes, no framework. */
+
+:root {
+  --bg: #fbfaf8;
+  --panel: #ffffff;
+  --ink: #1b1a18;
+  --muted: #5f5b55;
+  --line: #e3ded6;
+  --accent: #8a4b2a;
+  --accent-soft: #f3e6dd;
+  --ok: #2f6d4f;
+  --warn: #8a5a10;
+  --warn-soft: #fdf4e3;
+  --code-bg: #f4f1ec;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161513;
+    --panel: #1e1d1a;
+    --ink: #ece8e1;
+    --muted: #a29b90;
+    --line: #322f2a;
+    --accent: #d99a6c;
+    --accent-soft: #2c231d;
+    --ok: #7fc4a0;
+    --warn: #e0b26a;
+    --warn-soft: #2a2318;
+    --code-bg: #131210;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.65 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 0 20px;
+}
+
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+
+code {
+  font-family: var(--mono);
+  font-size: 0.9em;
+  background: var(--code-bg);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+/* -- header -------------------------------------------------------------- */
+
+.top {
+  border-bottom: 1px solid var(--line);
+  padding: 44px 0 30px;
+  background: var(--panel);
+}
+
+.top h1 {
+  margin: 0;
+  font-size: 2.4rem;
+  letter-spacing: -0.02em;
+  font-weight: 650;
+}
+
+.tagline {
+  margin: 10px 0 18px;
+  max-width: 58ch;
+  color: var(--muted);
+  font-size: 1.02rem;
+}
+
+.top nav { display: flex; gap: 18px; flex-wrap: wrap; font-size: 0.92rem; }
+
+/* -- sections ------------------------------------------------------------ */
+
+main { padding: 40px 20px 10px; }
+
+section { margin: 0 0 52px; }
+
+h2 {
+  font-size: 1.28rem;
+  letter-spacing: -0.01em;
+  margin: 0 0 14px;
+}
+
+h3 { font-size: 0.98rem; margin: 0 0 10px; }
+
+p { margin: 0 0 14px; max-width: 70ch; }
+
+.lead { color: var(--muted); }
+
+/* -- the console --------------------------------------------------------- */
+
+.console {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 20px;
+  margin-bottom: 56px;
+}
+
+.console-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.console-head h2 { margin: 0; }
+
+.examples { display: flex; gap: 8px; flex-wrap: wrap; }
+
+.chip {
+  font: inherit;
+  font-size: 0.82rem;
+  padding: 4px 11px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.chip:hover { border-color: var(--accent); color: var(--accent); }
+.chip.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
+textarea {
+  width: 100%;
+  font-family: var(--mono);
+  font-size: 0.86rem;
+  line-height: 1.6;
+  padding: 14px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--code-bg);
+  color: var(--ink);
+  resize: vertical;
+  tab-size: 2;
+}
+
+textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0;
+  flex-wrap: wrap;
+}
+
+button.primary, button.ghost, .button {
+  font: inherit;
+  font-size: 0.9rem;
+  padding: 8px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 1px solid var(--accent);
+  text-decoration: none;
+  display: inline-block;
+}
+
+button.primary, .button { background: var(--accent); color: var(--bg); }
+button.ghost, .button.ghost { background: transparent; color: var(--accent); }
+button:disabled { opacity: 0.55; cursor: default; }
+
+.state { font-size: 0.82rem; color: var(--muted); }
+
+.out {
+  font-family: var(--mono);
+  font-size: 0.82rem;
+  line-height: 1.55;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  margin: 0;
+  min-height: 5.5em;
+  max-height: 26em;
+  overflow: auto;
+  white-space: pre;
+}
+
+.out[data-kind="erro"] { border-color: var(--warn); }
+
+.fineprint {
+  font-size: 0.86rem;
+  color: var(--muted);
+  margin: 14px 0 0;
+  max-width: none;
+}
+
+/* -- number cards -------------------------------------------------------- */
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(232px, 1fr));
+  gap: 14px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+
+.card .big {
+  font-size: 1.9rem;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  margin: 0 0 4px;
+  line-height: 1.1;
+}
+
+.card .of { font-size: 1rem; font-weight: 400; color: var(--muted); }
+.card .small { margin: 0 0 12px; font-size: 0.9rem; }
+
+.card .note {
+  font-size: 0.82rem;
+  color: var(--muted);
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+  margin: 0;
+}
+
+/* The caveat sits against the number it qualifies, not in a footnote. */
+.card .note.warn {
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  border-radius: 6px;
+  padding: 9px 11px;
+  color: var(--ink);
+}
+
+/* -- diagram ------------------------------------------------------------- */
+
+.diagram {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  line-height: 1.6;
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+  overflow-x: auto;
+  margin: 0 0 14px;
+}
+
+/* -- closing ------------------------------------------------------------- */
+
+.closing { border-top: 1px solid var(--line); padding-top: 34px; }
+.links { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+
+footer {
+  border-top: 1px solid var(--line);
+  padding: 22px 20px 40px;
+  font-size: 0.84rem;
+  color: var(--muted);
+}
+
+footer p { margin: 0; }
+
+@media (max-width: 560px) {
+  .top h1 { font-size: 1.9rem; }
+  .console { padding: 15px; border-radius: 10px; }
+}

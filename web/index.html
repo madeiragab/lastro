@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>lastro — um banco de dados relacional escrito do zero</title>
+<meta name="description" content="Pager, B+Tree, write-ahead log com recovery ARIES, SQL e MVCC, escritos do zero em Rust. Rode o motor de verdade no navegador.">
+<link rel="stylesheet" href="./style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗄️</text></svg>">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <h1>lastro</h1>
+    <p class="tagline">Um banco de dados relacional embutido, escrito do zero em Rust.
+      Pager, B+Tree, write-ahead log com recovery ARIES, SQL e MVCC — sem engine por baixo.</p>
+    <nav>
+      <a href="https://github.com/madeiragab/lastro">Repositório</a>
+      <a href="https://github.com/madeiragab/lastro/blob/main/docs/pt/01-arquitetura.md">Documentação</a>
+      <a href="https://github.com/madeiragab/lastro/blob/main/README.md#diário-de-bugs">Diário de bugs</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <!-- O produto primeiro. A tese vem depois. -->
+  <section class="console" id="console">
+    <div class="console-head">
+      <h2>Rode o banco aqui</h2>
+      <div class="examples" id="examples"></div>
+    </div>
+
+    <textarea id="sql" spellcheck="false" rows="14" aria-label="comandos SQL"></textarea>
+
+    <div class="controls">
+      <button id="run" class="primary" disabled>Carregando o motor…</button>
+      <button id="reset" class="ghost">Apagar o banco</button>
+      <span id="state" class="state"></span>
+    </div>
+
+    <pre id="out" class="out" aria-live="polite" aria-label="saída"></pre>
+
+    <p class="fineprint">
+      Isto é <strong>o motor de verdade</strong>, o mesmo binário do repositório, compilado para
+      WebAssembly. O mesmo pager, a mesma B+Tree, o mesmo log. O que muda é o disco: no lugar dele
+      há um arquivo em memória dentro da sua aba, que existe enquanto a página estiver aberta e
+      some quando você fechar. Nada sai do seu navegador — não há servidor nenhum atrás disto.
+    </p>
+  </section>
+
+  <section>
+    <h2>O que ele é, e o que não é</h2>
+    <p>
+      <strong>É</strong> um motor de armazenamento completo: páginas de 4 KB gerenciadas na mão,
+      índice B+Tree com split e fusão, log de escrita adiantada com as três passadas do ARIES,
+      camada SQL com junções e índices secundários, e MVCC com snapshot isolation.
+    </p>
+    <p>
+      <strong>Não é</strong> para produção, e nunca vai ser. Tem um escritor por vez, o checkpoint
+      para o mundo, chave grande não cabe, e página de dados não tem soma de verificação contra
+      escrita parcial. Cada uma dessas ausências está declarada no README com o motivo — nenhuma
+      está escondida.
+    </p>
+  </section>
+
+  <section>
+    <h2>Os números</h2>
+    <p class="lead">
+      Nada aqui foi estimado. Tudo é medido na integração contínua, e o comando para reproduzir
+      está ao lado de cada número no repositório.
+    </p>
+
+    <div class="cards">
+
+      <article class="card">
+        <h3>Durabilidade</h3>
+        <p class="big">0</p>
+        <p class="small">violações de atomicidade em <strong>20.000</strong> quedas de energia
+          simuladas por noite.</p>
+        <p class="note">
+          O que está modelado é perda de energia, não processo morto. Processo morto perde os
+          próprios buffers, mas o que já chegou ao sistema operacional é gravado de qualquer jeito
+          — o teste passaria mesmo sem a regra WAL existir. Aqui, <strong>só o que passou por
+          <code>fsync</code> sobrevive</strong>.
+        </p>
+      </article>
+
+      <article class="card">
+        <h3>Compatibilidade</h3>
+        <p class="big">9.172 <span class="of">/ 9.172</span></p>
+        <p class="small">asserções do corpus do próprio SQLite, aprovadas. Zero reprovadas.</p>
+        <p class="note warn">
+          O número que anda junto: <strong>35,1% do corpus conseguiu rodar</strong>. O resto pede
+          SQL que este banco não tem. Publicar 100% escondendo isso seria mentira estatística, e as
+          ausências saem listadas e ranqueadas no relatório.
+        </p>
+      </article>
+
+      <article class="card">
+        <h3>Desempenho</h3>
+        <p class="big">9× a 13×</p>
+        <p class="small">mais lento que o SQLite na escrita, com durabilidade igualada.</p>
+        <p class="note">
+          Publicado perdendo, de propósito. Mas <strong>1,4×</strong> quando cada linha é uma
+          transação: onde o <code>fsync</code> domina, os motores convergem — e é essa linha que
+          valida a medição inteira.
+        </p>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <h2>Como uma consulta atravessa</h2>
+    <pre class="diagram">
+texto  →  lexer  →  árvore  →  binder  →  planner  →  executor  →  linhas
+                                              │            │
+                                              │            ↓
+                                              │       B+Tree  ←→  buffer pool
+                                              │                        │
+                                     EXPLAIN  ┘                        ↓
+                                                        write-ahead log  →  arquivo</pre>
+    <p>
+      Cada seta é uma transformação entre estruturas de dados, testável sozinha. O
+      <code>EXPLAIN</code> existe desde o começo porque planner que não mostra o que decidiu é
+      planner que não dá para conferir — experimente no console acima.
+    </p>
+  </section>
+
+  <section class="closing">
+    <h2>Por que existe</h2>
+    <p>
+      Quase todo mundo que escreve backend usa banco de dados todo dia sem saber o que acontece
+      entre o <code>INSERT</code> e o dado estar seguro no disco. A pergunta que move o projeto é
+      estreita: <strong>o que acontece se a luz cair exatamente no meio de um <code>COMMIT</code>?</strong>
+    </p>
+    <p>
+      A resposta certa é que ou a transação inteira aconteceu, ou nenhuma parte dela aconteceu.
+      Nunca metade. Escrever o banco foi a parte fácil; provar que ele não perde seus dados foi o
+      projeto.
+    </p>
+    <p class="links">
+      <a class="button" href="https://github.com/madeiragab/lastro">Ver o código</a>
+      <a class="button ghost" href="https://github.com/madeiragab/lastro/blob/main/README.en.md">Read in English</a>
+    </p>
+  </section>
+
+</main>
+
+<footer class="wrap">
+  <p>
+    lastro · <a href="https://github.com/madeiragab">madeiragab</a> ·
+    licença MIT · esta página roda inteiramente no seu navegador
+  </p>
+</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
