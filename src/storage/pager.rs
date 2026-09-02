@@ -267,6 +267,32 @@ impl Pager {
         Ok(id)
     }
 
+    /// Extends the file until it holds at least `count` pages.
+    ///
+    /// Recovery needs this: the metadata page is only made durable at a
+    /// checkpoint, so after a crash it can name fewer pages than the log
+    /// refers to. Unlike [`Pager::allocate`] this never touches the freelist,
+    /// because the caller has a specific page number in mind.
+    pub fn ensure_page_count(&mut self, count: u32) -> Result<()> {
+        if self.meta.page_count >= count {
+            return Ok(());
+        }
+        // Only ever extends. A page that is already in the file keeps whatever
+        // it holds: after a crash its content may be the only copy of something
+        // the log no longer describes, and blanking it would destroy that.
+        let on_disk = (self.file.metadata()?.len() / PAGE_SIZE as u64) as u32;
+        let blank = Page::zeroed();
+        while self.meta.page_count < count {
+            let id = self.meta.page_count;
+            self.meta.page_count += 1;
+            if id >= on_disk {
+                write_all_at(&self.file, blank.as_bytes(), offset_of(id))?;
+                self.stats.writes += 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Returns a page to the freelist. The file never shrinks; see
     /// `docs/en/03-pager.md` on why compaction is out of scope.
     pub fn free(&mut self, id: PageId) -> Result<()> {

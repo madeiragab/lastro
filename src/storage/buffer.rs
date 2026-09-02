@@ -16,7 +16,9 @@ use std::collections::HashMap;
 
 use crate::storage::page::{Page, PageType};
 use crate::storage::pager::Pager;
-use crate::{Error, PageId, Result};
+use crate::wal::record::{PageEdit, RecordBody};
+use crate::wal::Wal;
+use crate::{Error, Lsn, PageId, Result, TxId};
 
 /// A pin on a cached page. Hand it back to [`BufferPool::unpin`] when done.
 ///
@@ -57,6 +59,7 @@ pub struct BufferPool {
     table: HashMap<PageId, usize>,
     clock_hand: usize,
     pager: Pager,
+    wal: Option<Wal>,
 }
 
 impl BufferPool {
@@ -72,12 +75,86 @@ impl BufferPool {
             table: HashMap::with_capacity(capacity),
             clock_hand: 0,
             pager,
+            wal: None,
         }
     }
 
     /// How many frames the pool has.
     pub fn capacity(&self) -> usize {
         self.frames.len()
+    }
+
+    /// Attaches a log. From here on no dirty page reaches disk before the
+    /// record describing it does.
+    pub fn attach_wal(&mut self, wal: Wal) {
+        self.wal = Some(wal);
+    }
+
+    /// The attached log, if there is one.
+    pub fn wal(&self) -> Option<&Wal> {
+        self.wal.as_ref()
+    }
+
+    /// The attached log, mutable.
+    pub fn wal_mut(&mut self) -> Option<&mut Wal> {
+        self.wal.as_mut()
+    }
+
+    /// Logs a change to a range of bytes in a pinned page, then applies it.
+    ///
+    /// The before image is read off the page as it stands, which is what lets
+    /// undo reverse the change later. The page is stamped with the record's LSN
+    /// *after* the bytes go in, so an edit that happens to span the header's own
+    /// LSN field cannot leave a stale value behind.
+    pub fn logged_write(
+        &mut self,
+        txid: TxId,
+        prev_lsn: Lsn,
+        pin: &PinnedPage,
+        offset: usize,
+        after: &[u8],
+    ) -> Result<Lsn> {
+        let before = self.frames[pin.frame].page.as_bytes()[offset..offset + after.len()].to_vec();
+        let edit = PageEdit::new(pin.page_id, offset as u16, before, after.to_vec());
+
+        let wal = self.wal.as_mut().ok_or(Error::NoLogAttached)?;
+        let lsn = wal.append(txid, prev_lsn, RecordBody::Update(edit))?;
+
+        let page = self.page_mut(pin);
+        page.as_bytes_mut()[offset..offset + after.len()].copy_from_slice(after);
+        page.set_lsn(lsn);
+        Ok(lsn)
+    }
+
+    /// Replaces a pinned page with `image`, logging only the bytes that moved.
+    ///
+    /// This is what keeps whole-page rewrites from costing whole-page log
+    /// records, and so what keeps the logging physiological rather than
+    /// physical. Returns `None` when the image is identical and nothing was
+    /// logged.
+    pub fn logged_replace(
+        &mut self,
+        txid: TxId,
+        prev_lsn: Lsn,
+        pin: &PinnedPage,
+        image: &Page,
+    ) -> Result<Option<Lsn>> {
+        let edit = PageEdit::between(
+            pin.page_id,
+            self.frames[pin.frame].page.as_bytes(),
+            image.as_bytes(),
+        );
+        let Some(edit) = edit else {
+            return Ok(None);
+        };
+
+        let wal = self.wal.as_mut().ok_or(Error::NoLogAttached)?;
+        let lsn = wal.append(txid, prev_lsn, RecordBody::Update(edit))?;
+
+        let page = self.page_mut(pin);
+        *page = image.clone();
+        page.set_lsn(lsn);
+        Ok(Some(lsn))
     }
 
     /// The pager underneath.
@@ -245,9 +322,15 @@ impl BufferPool {
             return Ok(());
         };
 
-        // The WAL rule belongs here: before this write, the log must be flushed
-        // up to `self.frames[index].page.lsn()`. There is no log yet, so there
-        // is nothing to wait for. See docs/en/05-wal-recovery.md.
+        // The WAL rule, and the single most important line in the storage
+        // layer: the record describing this page reaches the medium before the
+        // page does. Delete it and every test still passes, and the database
+        // corrupts silently at the first power loss.
+        let lsn = self.frames[index].page.lsn();
+        if let Some(wal) = self.wal.as_mut() {
+            wal.sync_through(lsn)?;
+        }
+
         self.pager.write_page(id, &self.frames[index].page)?;
         self.frames[index].dirty = false;
         Ok(())

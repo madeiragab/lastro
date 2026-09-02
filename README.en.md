@@ -24,14 +24,21 @@ number only goes in after it has been measured.
 | Pager and freelist | done |
 | Buffer pool with clock policy | done |
 | B+Tree | done |
-| WAL + crash recovery | not started |
+| WAL: record format, the WAL rule, ARIES recovery | done |
+| Crash fuzzer | not started |
 | SQL (parser, planner, executor) | not started |
 | MVCC / snapshot isolation | not started |
 | Proof suite | partial: model and property tests done, crash fuzzer not |
 
 What already runs: creating and opening a `.lastro` file, allocating and freeing pages with
-freelist reuse, storing variable-length cells in slotted pages with compaction, reading and
-writing all of it through a fixed-size buffer pool, and inspecting the file with `lastro-cli`.
+freelist reuse, storing variable-length cells in slotted pages with compaction, a B+Tree index
+with splitting and merging on top of that, and a write-ahead log with full ARIES recovery — a
+committed transaction survives a crash that lost its page, and an uncommitted one is reversed
+even if its page already reached disk.
+
+The WAL rule sits in the buffer pool's eviction path: no dirty page reaches disk before the
+record describing it. It is one line of code, and it is the difference between a database and a
+file that sometimes has your data.
 
 The library has no dependencies: CRC32C, the varint codec and the encodings are written here.
 
