@@ -1,0 +1,15 @@
+[package]
+name = "lastro-bench"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.82"
+description = "lastro measured against SQLite on the same workloads and the same durability."
+license = "MIT"
+publish = false
+
+# This crate exists so that `lastro` itself keeps the single dependency it
+# claims. SQLite is compiled from source here, and only here.
+[dependencies]
+lastro = { path = ".." }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
