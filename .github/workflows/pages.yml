@@ -44,11 +44,23 @@ jobs:
 
       # The CLI already takes its statements as an argument, so it needs no
       # changes to be driven from JavaScript: argv in, stdout out.
+      #
+      # The release profile in Cargo.toml keeps debug symbols, because
+      # flamegraphs need them. Here they are nine megabytes somebody has to
+      # download before they can type a SELECT, so this build overrides the
+      # profile from the command line rather than taking them away from the
+      # profiling that wants them.
       - name: Build lastro-cli for wasm32-wasip1
-        run: cargo build --release --target wasm32-wasip1 --bin lastro-cli
+        run: |
+          cargo build --release --target wasm32-wasip1 --bin lastro-cli             --config profile.release.debug=false             --config profile.release.strip=true             --config profile.release.lto=true             --config profile.release.codegen-units=1
+          ls -la target/wasm32-wasip1/release/lastro-cli.wasm
 
-      - name: Report the size
-        run: ls -la target/wasm32-wasip1/release/lastro-cli.wasm
+      - name: Shrink it further
+        run: |
+          sudo apt-get install -y --no-install-recommends binaryen
+          wasm-opt -Oz --enable-bulk-memory             target/wasm32-wasip1/release/lastro-cli.wasm             -o /tmp/lastro.wasm
+          echo "antes e depois:"
+          ls -la target/wasm32-wasip1/release/lastro-cli.wasm /tmp/lastro.wasm
 
       # The WASI shim is vendored into the site rather than pulled from a CDN at
       # run time. A page that needs a third party to be up in order to work is a
@@ -63,7 +75,7 @@ jobs:
       - name: Assemble the site
         run: |
           cp web/index.html web/app.js web/style.css site/
-          cp target/wasm32-wasip1/release/lastro-cli.wasm site/lastro.wasm
+          cp /tmp/lastro.wasm site/lastro.wasm
           # The demo scripts are read at run time so they can be edited without
           # touching JavaScript.
           cp -r web/examples site/examples
