@@ -28,7 +28,8 @@ number only goes in after it has been measured.
 | WAL: record format, the WAL rule, ARIES recovery | done |
 | B+Tree transactional over the log | done |
 | Crash fuzzer | done |
-| SQL (parser, planner, executor) | not started |
+| SQL: lexer, syntax tree, parser | done |
+| SQL: binder, catalog, planner, executor | not started |
 | MVCC / snapshot isolation | not started |
 | Proof suite | partial: model and property tests done, crash fuzzer not |
 
