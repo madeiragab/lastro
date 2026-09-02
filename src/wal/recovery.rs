@@ -32,13 +32,16 @@ pub struct RecoveryReport {
     pub edits_skipped: usize,
     /// Edits reversed during undo.
     pub edits_undone: usize,
+    /// Pages the file was missing when it was opened, because the page count
+    /// reached the disk and some of the pages it counted did not.
+    pub pages_restored: u64,
 }
 
 impl RecoveryReport {
     /// True when the log had nothing to say, which is what a clean shutdown
     /// leaves behind.
     pub fn was_clean(&self) -> bool {
-        self.records_scanned == 0 && self.torn_tail_bytes == 0
+        self.records_scanned == 0 && self.torn_tail_bytes == 0 && self.pages_restored == 0
     }
 }
 
@@ -57,6 +60,7 @@ pub fn recover(pool: &mut BufferPool) -> Result<RecoveryReport> {
     let file_len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
     let mut report = RecoveryReport {
+        pages_restored: pool.pager().truncated_pages(),
         records_scanned: records.len(),
         torn_tail_bytes: (base + file_len).saturating_sub(intact_lsn),
         ..RecoveryReport::default()

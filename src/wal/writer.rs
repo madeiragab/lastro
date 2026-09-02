@@ -5,6 +5,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::record::{Record, RecordBody};
+use crate::storage::crash::CrashHandle;
 use crate::{Lsn, Result, TxId};
 
 /// Counters for what the log has done. The crash fuzzer uses these to pick
@@ -42,6 +43,8 @@ pub struct Wal {
     /// Every record below this offset is on the physical medium.
     durable: Lsn,
     stats: WalStats,
+    /// Set only under the crash fuzzer.
+    sim: Option<CrashHandle>,
 }
 
 impl Wal {
@@ -77,6 +80,7 @@ impl Wal {
             pending: Vec::new(),
             durable: end,
             stats: WalStats::default(),
+            sim: None,
         })
     }
 
@@ -120,9 +124,25 @@ impl Wal {
         Ok(lsn)
     }
 
+    /// Arms a simulated power loss. Only the crash fuzzer does this.
+    pub fn arm_crash_sim(&mut self, sim: CrashHandle) {
+        self.sim = Some(sim);
+    }
+
+    /// Whether the simulated power has been cut.
+    pub fn crashed(&self) -> bool {
+        self.sim
+            .as_ref()
+            .map(|sim| sim.borrow().crashed())
+            .unwrap_or(false)
+    }
+
     /// Writes the pending tail to the file without forcing it to the medium.
     pub fn flush(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
+        // Under a power loss model a write that was never synced is lost, so
+        // there is nothing to gain by moving the bytes to the file early. They
+        // wait, and the sync decides how much of them survives.
+        if self.sim.is_some() || self.pending.is_empty() {
             return Ok(());
         }
         self.file.seek(SeekFrom::End(0))?;
@@ -136,6 +156,29 @@ impl Wal {
     ///
     /// This is the only `fsync` on the commit path, and it is sequential.
     pub fn sync(&mut self) -> Result<()> {
+        if let Some(sim) = self.sim.clone() {
+            let waiting = self.pending.len();
+            let Some(landing) = sim.borrow_mut().admit(waiting) else {
+                return Ok(());
+            };
+
+            // A partial landing is the torn tail: the record that was being
+            // written when the power went. Its checksum will not verify, and
+            // recovery is supposed to treat that as the end of the log.
+            let offset = (self.end - self.base) - waiting as Lsn;
+            self.file.seek(SeekFrom::Start(offset))?;
+            self.file.write_all(&self.pending[..landing])?;
+            self.file.sync_all()?;
+            self.stats.writes += 1;
+            self.stats.syncs += 1;
+
+            if landing == waiting {
+                self.pending.clear();
+                self.durable = self.end;
+            }
+            return Ok(());
+        }
+
         self.flush()?;
         self.file.sync_all()?;
         self.durable = self.end;
