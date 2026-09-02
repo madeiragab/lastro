@@ -257,6 +257,18 @@ impl Database {
                 self.catalog = catalog;
                 Ok(Outcome::Ack)
             }
+            Plan::Vacuum { tables } => {
+                // The horizon is the transaction doing the sweeping. Everything
+                // below it has settled; anything at or above it may still be
+                // read by somebody, this transaction included.
+                let horizon = writer.txid;
+                let mut removed = 0;
+                for table in &tables {
+                    let report = exec::vacuum(&mut self.pool, table, horizon)?;
+                    removed += report.versions + report.entries;
+                }
+                Ok(Outcome::Affected(removed))
+            }
             Plan::CreateIndex { mut table, index } => {
                 let tree = BTree::create(&mut self.pool)?;
                 let mut index = index;

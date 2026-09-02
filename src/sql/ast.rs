@@ -28,6 +28,8 @@ pub enum Statement {
     Commit,
     /// `ROLLBACK`
     Rollback,
+    /// `VACUUM`, over one table or over every one.
+    Vacuum(Option<String>),
     /// `EXPLAIN`, wrapping the statement whose plan is wanted.
     Explain(Box<Statement>),
 }
@@ -419,6 +421,8 @@ impl fmt::Display for Statement {
             Statement::Begin => write!(f, "BEGIN"),
             Statement::Commit => write!(f, "COMMIT"),
             Statement::Rollback => write!(f, "ROLLBACK"),
+            Statement::Vacuum(None) => write!(f, "VACUUM"),
+            Statement::Vacuum(Some(table)) => write!(f, "VACUUM {table}"),
             Statement::Explain(inner) => write!(f, "EXPLAIN {inner}"),
             Statement::Select(select) => write!(f, "{select}"),
             Statement::Insert(insert) => write!(f, "{insert}"),

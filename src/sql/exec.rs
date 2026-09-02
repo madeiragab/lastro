@@ -1209,6 +1209,88 @@ fn index_values(index: &IndexSchema, row: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+// -- reclaiming ------------------------------------------------------------
+
+/// What a sweep removed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VacuumReport {
+    /// Versions nobody could see any more, now gone.
+    pub versions: usize,
+    /// Index entries that pointed at them.
+    pub entries: usize,
+}
+
+/// Removes the versions no transaction, present or future, can reach.
+///
+/// A version is dead when it was removed by a transaction that finished before
+/// `horizon`. Everything below the horizon is settled, so nothing that could
+/// still be reading is deprived of anything.
+///
+/// The long transaction problem, worth naming because it bites in practice: a
+/// transaction left open holds the horizon back, and nothing newer than it can
+/// be reclaimed however often this runs. In Postgres that is called bloat and
+/// it causes half the production incidents with that database. The mitigation
+/// here is the same one — the horizon is reported, so the cause is visible.
+pub fn vacuum(
+    pool: &mut BufferPool,
+    table: &TableSchema,
+    horizon: TxId,
+) -> Result<VacuumReport> {
+    let types = column_types(table);
+    let mut report = VacuumReport::default();
+
+    // Everything is read before anything is removed, for the same reason a
+    // write gathers first: a cursor must not walk a tree being rewritten.
+    let mut dead = Vec::new();
+    let mut live: HashMap<i64, Row> = HashMap::new();
+    {
+        let tree = BTree::open(table.root);
+        let mut cursor = tree.cursor(pool, None)?;
+        while let Some((key, value)) = cursor.next(pool)? {
+            let (rowid, _) = split_row_key(&key)?;
+            let (xmax, row) = decode_version(&value, &types)?;
+            if xmax != 0 && xmax < horizon {
+                dead.push(key);
+            } else if xmax == 0 {
+                live.insert(rowid, row);
+            }
+        }
+    }
+
+    let mut tree = BTree::open(table.root);
+    for key in &dead {
+        tree.delete(pool, key)?;
+        report.versions += 1;
+    }
+
+    // An index entry outlives the version it was written for, so the entries
+    // left pointing at nothing go now too.
+    for index in &table.indexes {
+        let mut stale = Vec::new();
+        {
+            let tree = BTree::open(index.root);
+            let mut cursor = tree.cursor(pool, None)?;
+            while let Some((key, _)) = cursor.next(pool)? {
+                let rowid = rowid_of(&key)?;
+                let matches = match live.get(&rowid) {
+                    Some(row) => index_key(index, row, rowid)? == key,
+                    None => false,
+                };
+                if !matches {
+                    stale.push(key);
+                }
+            }
+        }
+        let mut tree = BTree::open(index.root);
+        for key in &stale {
+            tree.delete(pool, key)?;
+            report.entries += 1;
+        }
+    }
+
+    Ok(report)
+}
+
 /// The rows a write is about to touch, gathered before any of them change.
 ///
 /// Collected first on purpose. A cursor holds no pin between calls, which is

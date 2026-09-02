@@ -221,6 +221,11 @@ pub enum Plan {
     Commit,
     /// Ends one, discarding its work.
     Rollback,
+    /// Reclaims the space versions nobody can see are holding.
+    Vacuum {
+        /// The tables to sweep.
+        tables: Vec<TableSchema>,
+    },
 }
 
 impl TableSchema {
@@ -242,6 +247,12 @@ pub fn plan(pool: &mut BufferPool, catalog: &Catalog, statement: &ast::Statement
         ast::Statement::Begin => Ok(Plan::Begin),
         ast::Statement::Commit => Ok(Plan::Commit),
         ast::Statement::Rollback => Ok(Plan::Rollback),
+        ast::Statement::Vacuum(table) => Ok(Plan::Vacuum {
+            tables: match table {
+                Some(name) => vec![catalog.require(pool, name)?],
+                None => catalog.tables(pool)?,
+            },
+        }),
         ast::Statement::Select(select) => plan_select(pool, catalog, select),
         ast::Statement::Insert(insert) => plan_insert(pool, catalog, insert),
         ast::Statement::Update(update) => plan_update(pool, catalog, update),
@@ -1243,6 +1254,10 @@ impl Plan {
             }
             Plan::Rollback => {
                 let _ = writeln!(out, "{pad}Rollback");
+            }
+            Plan::Vacuum { tables } => {
+                let names: Vec<&str> = tables.iter().map(|table| table.name.as_str()).collect();
+                let _ = writeln!(out, "{pad}Vacuum {}", names.join(", "));
             }
         }
     }
