@@ -20,13 +20,14 @@ number only goes in after it has been measured.
 | Layer | State |
 |---|---|
 | Specification and documentation | done |
+| Roadmap stages 0 through 3 | done |
 | File format, slotted page, encodings | done |
 | Pager and freelist | done |
 | Buffer pool with clock policy | done |
 | B+Tree | done |
 | WAL: record format, the WAL rule, ARIES recovery | done |
 | B+Tree transactional over the log | done |
-| Crash fuzzer | not started |
+| Crash fuzzer | done |
 | SQL (parser, planner, executor) | not started |
 | MVCC / snapshot isolation | not started |
 | Proof suite | partial: model and property tests done, crash fuzzer not |
@@ -157,6 +158,29 @@ cargo run --bin lastro-cli -- page example.lastro 1
 No number goes in here without having been measured, with the command next to it. Full
 methodology in [08 · Testing and proof](docs/en/08-testing.md).
 
+**Durability** — the crash fuzzer. Power is cut at the *n*-th sync point, and the sweep covers
+every one of them. After each cut the database is fully reopened and checked.
+
+| Metric | Value |
+|---|---|
+| Seeds per continuous integration run | 120 |
+| Seeds in the daily run | 20,000, in 8m27s |
+| Sync points swept exhaustively | all of them, across one full workload |
+| Atomicity violations | 0 |
+
+To reproduce: `LASTRO_FUZZ_SEEDS=20000 cargo test --release --test crash_fuzz`. Any seed that
+fails prints the seed and the cut point, and becomes a fixed test.
+
+The property being checked, precisely: **after recovery the database holds a state corresponding
+to some prefix of the confirmed commit sequence.** Not one commit more, not one fewer, and never
+anything in between.
+
+Why power loss and not `SIGKILL`: a killed process loses its own buffers, but every write that
+already reached the operating system stays in the page cache and gets written out anyway. The
+data survives, the WAL rule is never put under pressure, and the test passes whether or not the
+rule is even there. What is modelled is the thing that actually matters — **only what was
+`fsync`ed survives.**
+
 **Compatibility** — SQLite's SQL Logic Test suite, written by third parties, run against the
 SQL subset implemented here.
 
@@ -189,6 +213,23 @@ that shows who won, it is the one that explains why.
 
 A record of the mistakes that cost real time, because that is the part that actually taught
 something.
+
+### The metadata page that went down before the others
+
+Found by the crash fuzzer on its first run, which is the best possible argument for having
+written the fuzzer.
+
+At sync time the pending pages were written in page-number order. The metadata page is number
+zero, so it reached the disk **first** — counting pages that had not got there yet. The next open
+found a file holding three pages and metadata claiming five, and refused the database.
+
+The missing rule is simple and holds for anything that points at anything else: **what refers
+goes down after what is referred to.** The metadata page now goes last, and only if all the
+others made it.
+
+A second thing came with it, not a bug but undue strictness: opening refused a file shorter than
+the metadata claimed. After a crash that is normal, not corruption. The missing pages come back
+blank and recovery fills in whatever the log has to say about them.
 
 ### The redo that skipped everything, silently
 
