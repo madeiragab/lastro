@@ -1,23 +1,23 @@
 # lastro
 
+**Português** · [English](README.en.md)
+
 **Um banco de dados relacional embutido, escrito do zero em Rust.**
 
 Páginas em disco, B+Tree, write-ahead log com crash recovery, parser SQL e MVCC.
 Sem dependência de engine externa. O objetivo não é competir com o SQLite — é entender,
 linha por linha, o que um banco de dados faz entre o seu `INSERT` e o dado estar seguro no disco.
 
-> *An embedded relational database written from scratch in Rust: pager, B+Tree, WAL with crash
-> recovery, SQL parser and MVCC. Portuguese README; English version on request.*
-
 ---
 
 ## Status
 
-Em construção. Nada aqui é estável ainda, e os números das seções de benchmark estão vazios
-de propósito — só entram quando forem medidos de verdade.
+Em construção. Nada aqui é estável, e as tabelas de resultado estão vazias de propósito —
+número só entra depois de medido.
 
 | Camada | Estado |
 |---|---|
+| Especificação e documentação | concluída |
 | Pager / buffer pool | em andamento |
 | B+Tree | não começado |
 | WAL + crash recovery | não começado |
@@ -27,99 +27,75 @@ de propósito — só entram quando forem medidos de verdade.
 
 ---
 
+## Documentação
+
+O projeto foi especificado antes de ser escrito. O formato binário do arquivo, o formato do
+registro de log e as invariantes de cada estrutura estão definidos abaixo.
+
+| Documento | Assunto |
+|---|---|
+| [01 · Arquitetura](docs/pt/01-arquitetura.md) | As camadas, o que cada uma esconde da de cima |
+| [02 · Formato de arquivo](docs/pt/02-formato-de-arquivo.md) | Layout binário: header, slotted page, células, codificação de chave |
+| [03 · Pager e buffer pool](docs/pt/03-pager.md) | Páginas, pin/unpin, política clock, freelist |
+| [04 · B+Tree](docs/pt/04-btree.md) | Busca, split, merge, range scan, invariantes |
+| [05 · WAL e recovery](docs/pt/05-wal-recovery.md) | Formato do log, regra WAL, as três fases do ARIES |
+| [06 · SQL](docs/pt/06-sql.md) | Gramática, planner, operadores do executor |
+| [07 · MVCC](docs/pt/07-mvcc.md) | Versionamento, snapshot, regra de visibilidade, coleta |
+| [08 · Testes e provas](docs/pt/08-testes.md) | Crash fuzzer, sqllogictest, anomalias, benchmark |
+| [09 · Roadmap](docs/pt/09-roadmap.md) | Ordem de construção e critério de pronto por camada |
+| [10 · Glossário](docs/pt/10-glossario.md) | Vocabulário de banco de dados, sem enrolação |
+| [ADR](docs/pt/adr.md) | Decisões de arquitetura e o que foi descartado |
+
+---
+
 ## O que é e o que não é
 
 **É:** um banco embutido single-node e single-writer, no espírito do SQLite. Um arquivo, uma
 biblioteca, sem servidor. Transacional e durável de verdade — não um dicionário salvo em disco.
 
 **Não é:** distribuído, replicado, nem otimizado para vencer benchmark. Não tem planner baseado
-em custo, nem otimizador de junção, nem paralelismo intra-query. Essas coisas são interessantes,
-mas cada uma é um projeto inteiro, e um projeto raso em cinco frentes vale menos que um projeto
-sério em uma.
+em custo, nem otimizador de junção, nem paralelismo intra-query. Cada uma dessas coisas é um
+projeto inteiro, e um projeto raso em cinco frentes vale menos que um projeto sério em uma.
 
 ---
 
-## Arquitetura
+## Arquitetura em uma imagem
 
 ```mermaid
 flowchart TD
-    SQL["SQL de entrada"] --> LEX["Lexer + Parser"]
+    SQL["SQL de entrada"] --> LEX["Lexer e parser"]
     LEX --> AST["AST"]
     AST --> PLAN["Planner"]
     PLAN --> EXEC["Executor - modelo iterator"]
     EXEC --> TXN["Gerenciador de transacoes - MVCC"]
-    TXN --> ACCESS["Metodos de acesso: B+Tree, heap"]
+    TXN --> ACCESS["Metodos de acesso - B+Tree e heap"]
     ACCESS --> BUF["Buffer pool"]
-    BUF --> PAGER["Pager: paginas de 4 KB"]
+    BUF --> PAGER["Pager - paginas de 4 KB"]
     PAGER --> DISK[("arquivo .lastro")]
     TXN --> WAL["Write-ahead log"]
     WAL --> WALFILE[("arquivo .wal")]
     WALFILE -.->|recovery no boot| TXN
 ```
 
-Leitura de baixo para cima: o pager só entende páginas, a B+Tree só entende chave e valor,
-o executor só entende tuplas. Cada camada esconde a de baixo. É o mesmo desenho do SQLite e do
-Postgres, e o motivo de eu ter escolhido essa ordem é que cada camada pode ser testada sozinha
-antes da próxima existir.
+Detalhes em [01 · Arquitetura](docs/pt/01-arquitetura.md).
 
 ---
 
-## As camadas
+## O coração do projeto
 
-### 1. Pager
+A pergunta que move tudo: **o que acontece se a máquina morrer exatamente no meio de um `COMMIT`?**
 
-Arquivo dividido em páginas de 4 KB. Header com magic number e versão de formato, freelist para
-páginas recicladas, e *slotted pages* para acomodar tuplas de tamanho variável sem fragmentar.
-
-Acima dele, um **buffer pool** com política de substituição clock e contagem de pin/unpin — uma
-página em uso não pode ser despejada, e essa é a primeira invariante que o banco precisa nunca
-violar.
-
-### 2. B+Tree
-
-Índice ordenado com insert, delete, split, merge e *range scan*. Chaves e valores em bytes; a
-tipagem é problema da camada de cima.
-
-Testado com *property-based testing*: um milhão de chaves aleatórias, com as invariantes da
-árvore (ordem, taxa de ocupação, integridade dos ponteiros de irmão) verificadas a cada operação.
-
-### 3. WAL e recovery — o coração do projeto
-
-Write-ahead log com LSN, redo e undo, no espírito do ARIES, mais checkpointing para o log não
-crescer para sempre.
-
-A regra é a de sempre: **o log vai para o disco antes da página de dados**. É a diferença entre
-um banco de dados e um arquivo que às vezes tem seus dados.
-
-E aqui está a parte que dá nome ao projeto, o **crash fuzzer**:
+A resposta certa é que ou a transação inteira aconteceu, ou nenhuma parte dela aconteceu. Nunca
+metade. A única forma honesta de afirmar isso é testando — e é para isso que existe o
+**crash fuzzer**:
 
 > O processo mata a si mesmo, sem chance de limpar nada, em um ponto aleatório dentro do caminho
-> de commit. Reabre o banco. Roda recovery. Verifica que o estado é exatamente ou o anterior à
-> transação, ou o posterior a ela — nunca um meio-termo. Repete dezenas de milhares de vezes
-> na integração contínua.
+> de commit. Reabre o banco. Roda recovery. Um verificador confere que o estado é exatamente ou o
+> anterior à transação, ou o posterior a ela. Repete dezenas de milhares de vezes na integração
+> contínua.
 
-Escrever um banco é a parte fácil. Provar que ele não perde seus dados quando a luz cai no meio
-de um `COMMIT` é a parte que quase ninguém faz.
-
-### 4. SQL
-
-Lexer, parser recursivo descendente, AST, planner e executor no modelo iterator (Volcano) — cada
-nó do plano é um `next()` que puxa a tupla do nó abaixo.
-
-Subconjunto suportado: `CREATE TABLE`, `CREATE INDEX`, `INSERT`, `SELECT` com `WHERE`, `ORDER BY`
-e `LIMIT`, `UPDATE`, `DELETE`, junção *nested-loop* e *hash join*, e `EXPLAIN` mostrando o plano
-escolhido.
-
-O catálogo de schema fica em tabelas do próprio banco. O `lastro` descreve a si mesmo.
-
-### 5. MVCC
-
-Versionamento de tupla com txid de criação e de remoção, snapshot isolation e uma regra de
-visibilidade que decide o que cada transação enxerga. Mais um coletor das versões que ninguém
-mais pode ver.
-
-Escolhi MVCC em vez de travamento em duas fases porque é o modelo do Postgres, e porque a parte
-interessante — as anomalias que ele previne e as que ele *não* previne — é mensurável.
+Escrever um banco é a parte fácil. Provar que ele não perde seus dados é o projeto de verdade.
+Detalhes em [05 · WAL e recovery](docs/pt/05-wal-recovery.md) e [08 · Testes](docs/pt/08-testes.md).
 
 ---
 
@@ -133,33 +109,27 @@ cargo test
 cargo run --bin lastro-cli -- exemplo.lastro
 ```
 
-*(Ainda não funciona. Esta seção existe para eu me lembrar de que a experiência de uso importa
-tanto quanto o motor.)*
+*(Ainda não funciona. A seção existe para lembrar que a experiência de uso importa tanto quanto
+o motor.)*
 
 ---
 
 ## Provas
 
-Três suítes, e nenhum número entra aqui sem ter sido medido nesta máquina, com o comando ao lado.
+Nenhum número entra aqui sem ter sido medido, com o comando ao lado. Metodologia completa em
+[08 · Testes e provas](docs/pt/08-testes.md).
 
-### Compatibilidade
-
-Execução da suíte **SQL Logic Test** do SQLite — testes escritos por terceiros, não por mim,
-contra o subconjunto de SQL que o `lastro` implementa.
+**Compatibilidade** — a suíte SQL Logic Test do SQLite, escrita por terceiros, rodada contra o
+subconjunto de SQL implementado aqui.
 
 | Métrica | Valor |
 |---|---|
 | Testes executados | pendente |
 | Aprovados | pendente |
 
-### Correção transacional
-
-Bateria de anomalias clássicas, no estilo dos testes Jepsen, reduzida a um único nó: *dirty read*,
-*non-repeatable read*, *phantom read*, *lost update* e *write skew*.
-
-O resultado esperado não é passar em todas. Snapshot isolation, por definição, permite *write skew*.
-A tabela vai mostrar quais são prevenidas e quais não são, porque um banco que mente sobre seu
-nível de isolamento é pior que um banco lento.
+**Correção transacional** — as anomalias clássicas de isolamento. O objetivo não é passar em
+todas: snapshot isolation permite *write skew* por definição. A tabela mostra o que é prevenido
+e o que não é, porque um banco que mente sobre o próprio isolamento é pior que um banco lento.
 
 | Anomalia | Prevenida? |
 |---|---|
@@ -169,36 +139,16 @@ nível de isolamento é pior que um banco lento.
 | Lost update | pendente |
 | Write skew | pendente |
 
-### Desempenho
-
-Comparação com SQLite nas mesmas cargas: inserção sequencial, inserção aleatória, busca pontual
-por chave primária, varredura de intervalo.
-
-**Expectativa: o `lastro` perde, e por uma margem larga.** O SQLite tem 25 anos de otimização.
-Os gráficos vão ser publicados perdendo, com a análise de onde o tempo vai embora. O interessante
-de um benchmark não é quem ganha, é o perfil de execução que explica por quê.
-
----
-
-## Decisões e trade-offs
-
-**Rust.** Sem coletor de lixo significa latência previsível, que é exatamente o que um banco
-precisa. O sistema de tipos também transforma boa parte dos bugs de gerenciamento de buffer em
-erros de compilação. O custo é uma curva de aprendizado íngreme somada a um domínio já difícil.
-
-**Páginas de 4 KB.** Casa com o tamanho de bloco típico do sistema de arquivos, então uma página
-suja é uma escrita, e não duas.
-
-**Single-writer.** Escritor único remove uma classe inteira de problemas de concorrência e me
-deixa gastar esse tempo em recovery, que é onde está o aprendizado.
-
-**Nada de otimizador baseado em custo.** Ele merece um projeto próprio.
+**Desempenho** — comparação com SQLite nas mesmas cargas. Expectativa: o `lastro` perde por
+margem larga. O SQLite tem 25 anos de otimização. Os gráficos vão ser publicados perdendo, junto
+da análise de onde o tempo vai embora. Benchmark interessante não é o que mostra quem ganhou, é
+o que explica por quê.
 
 ---
 
 ## Diário de bugs
 
-Registro dos erros que custaram caro, porque essa é a parte que de fato ensinou alguma coisa.
+Registro dos erros que custaram caro, porque é a parte que de fato ensinou alguma coisa.
 
 *(A preencher. O primeiro provavelmente será corrupção de página.)*
 
