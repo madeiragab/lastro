@@ -13,13 +13,14 @@ use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use crate::index::{BTree, Cursor};
 use crate::sql::ast::{BinaryOp, DataType, UnaryOp};
 use crate::sql::catalog::{IndexSchema, TableSchema};
+use crate::sql::mvcc::{Snapshot, Version};
 use crate::sql::plan::{Bound, Plan, PlanExpr};
 use crate::storage::page::encoding::{
     decode_i64, decode_tuple, encode_i64, encode_key, encode_tuple, get_varint, put_varint, Value,
     ValueType,
 };
 use crate::storage::BufferPool;
-use crate::{Error, Result};
+use crate::{Error, Result, TxId};
 
 /// One row: the table's columns, in the order they were declared.
 pub type Row = Vec<Value>;
@@ -435,19 +436,109 @@ fn compare_rows(keys: &[(PlanExpr, bool)], left: &Row, right: &Row) -> Result<Or
     Ok(Ordering::Equal)
 }
 
+// -- versioned rows --------------------------------------------------------
+//
+// A row lives at key `rowid ++ xmin`, so every version of it is a separate
+// entry and they sort together, oldest first. The value carries `xmax` ahead of
+// the tuple, because that is the one field a later transaction has to change
+// without touching the rest.
+
+/// Bytes a row key takes: the row id, then the transaction that wrote it.
+pub const ROW_KEY_LEN: usize = 16;
+
+/// The key one version of a row lives at.
+pub fn row_key(rowid: i64, xmin: TxId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(ROW_KEY_LEN);
+    key.extend_from_slice(&encode_i64(rowid));
+    key.extend_from_slice(&xmin.to_be_bytes());
+    key
+}
+
+/// The smallest key any version of `rowid` can have.
+fn row_key_floor(rowid: i64) -> Vec<u8> {
+    row_key(rowid, 0)
+}
+
+/// The row id and creating transaction a key names.
+fn split_row_key(key: &[u8]) -> Result<(i64, TxId)> {
+    if key.len() != ROW_KEY_LEN {
+        return Err(Error::MalformedFile(
+            "a table key that is not a row id and a transaction".into(),
+        ));
+    }
+    let mut rowid = [0u8; 8];
+    rowid.copy_from_slice(&key[..8]);
+    let mut xmin = [0u8; 8];
+    xmin.copy_from_slice(&key[8..]);
+    Ok((decode_i64(rowid), TxId::from_be_bytes(xmin)))
+}
+
+/// Wraps a row in its version header.
+fn encode_version(xmax: TxId, row: &[Value]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&xmax.to_be_bytes());
+    encode_tuple(row, &mut out);
+    out
+}
+
+/// Splits a stored value into its removal stamp and the row itself.
+fn decode_version(value: &[u8], types: &[ValueType]) -> Result<(TxId, Row)> {
+    let head = value
+        .get(..8)
+        .ok_or_else(|| Error::MalformedFile("a version with no header".into()))?;
+    let mut xmax = [0u8; 8];
+    xmax.copy_from_slice(head);
+    let row = decode_tuple(&value[8..], types)
+        .ok_or_else(|| Error::MalformedFile("a row that does not decode".into()))?;
+    Ok((TxId::from_be_bytes(xmax), row))
+}
+
+/// The version of one row a snapshot should read, if any.
+fn fetch_visible(
+    pool: &mut BufferPool,
+    root: crate::PageId,
+    rowid: i64,
+    types: &[ValueType],
+    snapshot: Snapshot,
+) -> Result<Option<Row>> {
+    let tree = BTree::open(root);
+    let lower = row_key_floor(rowid);
+    let upper = row_key_floor(rowid.saturating_add(1));
+    let mut cursor = tree.cursor_range(pool, Some(&lower), Some(&upper))?;
+
+    while let Some((key, value)) = cursor.next(pool)? {
+        let (_, xmin) = split_row_key(&key)?;
+        let (xmax, row) = decode_version(&value, types)?;
+        if snapshot.sees(Version { xmin, xmax }) {
+            return Ok(Some(row));
+        }
+    }
+    Ok(None)
+}
+
 // -- operators -------------------------------------------------------------
 
 /// A running operator.
 #[derive(Debug)]
 pub enum Op {
-    /// Walks a table's tree, decoding each row.
+    /// Walks a table's tree, yielding the version of each row the snapshot
+    /// should see and skipping the rest.
     Scan {
         /// The column types, for decoding.
         types: Vec<ValueType>,
         /// Where in the tree the scan is.
         cursor: Cursor,
+        /// What this statement is allowed to see.
+        snapshot: Snapshot,
+        /// The last row already yielded, so its older versions are passed over.
+        last: Option<i64>,
     },
     /// Walks an index and fetches the row each entry points at.
+    ///
+    /// The index is deliberately allowed to be stale: entries are not removed
+    /// when a version is superseded, so an entry may name a row whose visible
+    /// version no longer matches. The planner keeps the equality in the filter
+    /// above for exactly that reason, and the fetch below checks visibility.
     IndexScan {
         /// The column types, for decoding a row.
         types: Vec<ValueType>,
@@ -455,6 +546,10 @@ pub enum Op {
         table_root: crate::PageId,
         /// Where in the index the walk is.
         cursor: Cursor,
+        /// What this statement is allowed to see.
+        snapshot: Snapshot,
+        /// Row ids already yielded, since an index may name one twice.
+        seen: std::collections::HashSet<i64>,
     },
     /// Drops rows the predicate does not admit.
     Filter {
@@ -544,36 +639,49 @@ impl Op {
     /// The next row, or `None` when the operator is done.
     pub fn next(&mut self, pool: &mut BufferPool) -> Result<Option<Row>> {
         match self {
-            Op::Scan { types, cursor } => match cursor.next(pool)? {
-                Some((_, value)) => decode_tuple(&value, types)
-                    .map(Some)
-                    .ok_or_else(|| Error::MalformedFile("a row that does not decode".into())),
-                None => Ok(None),
+            Op::Scan {
+                types,
+                cursor,
+                snapshot,
+                last,
+            } => loop {
+                let Some((key, value)) = cursor.next(pool)? else {
+                    return Ok(None);
+                };
+                let (rowid, xmin) = split_row_key(&key)?;
+                if *last == Some(rowid) {
+                    // An older version of a row already yielded. At most one
+                    // version of a row is ever visible, so there is nothing
+                    // left to find here.
+                    continue;
+                }
+                let (xmax, row) = decode_version(&value, types)?;
+                if snapshot.sees(Version { xmin, xmax }) {
+                    *last = Some(rowid);
+                    return Ok(Some(row));
+                }
             },
 
             Op::IndexScan {
                 types,
                 table_root,
                 cursor,
-            } => {
+                snapshot,
+                seen,
+            } => loop {
                 let Some((key, _)) = cursor.next(pool)? else {
                     return Ok(None);
                 };
                 // The row id rides at the end of every index key, which is what
                 // turns a match into a second descent rather than a scan.
                 let rowid = rowid_of(&key)?;
-                let table = BTree::open(*table_root);
-                match table.get(pool, &encode_i64(rowid))? {
-                    Some(encoded) => decode_tuple(&encoded, types)
-                        .map(Some)
-                        .ok_or_else(|| Error::MalformedFile("a row that does not decode".into())),
-                    // An index entry with no row behind it means the two have
-                    // drifted apart, which is corruption rather than an absence.
-                    None => Err(Error::MalformedFile(format!(
-                        "an index points at row {rowid}, which is not there"
-                    ))),
+                if !seen.insert(rowid) {
+                    continue;
                 }
-            }
+                if let Some(row) = fetch_visible(pool, *table_root, rowid, types, *snapshot)? {
+                    return Ok(Some(row));
+                }
+            },
 
             Op::Filter { input, predicate } => loop {
                 let Some(row) = input.next(pool)? else {
@@ -815,16 +923,23 @@ fn sort_batch(keys: &[(PlanExpr, bool)], rows: &mut [Row]) -> Result<()> {
 }
 
 /// Builds the running operator tree from a plan.
-pub fn build(plan: &Plan, pool: &mut BufferPool) -> Result<Op> {
-    build_with(plan, pool, DEFAULT_SORT_ROWS)
+pub fn build(plan: &Plan, pool: &mut BufferPool, snapshot: Snapshot) -> Result<Op> {
+    build_with(plan, pool, snapshot, DEFAULT_SORT_ROWS)
 }
 
 /// Builds the tree with a given sort budget, in rows.
-pub fn build_with(plan: &Plan, pool: &mut BufferPool, budget: usize) -> Result<Op> {
+pub fn build_with(
+    plan: &Plan,
+    pool: &mut BufferPool,
+    snapshot: Snapshot,
+    budget: usize,
+) -> Result<Op> {
     Ok(match plan {
         Plan::SeqScan { table } => Op::Scan {
             types: column_types(table),
             cursor: BTree::open(table.root).cursor(pool, None)?,
+            snapshot,
+            last: None,
         },
         Plan::RowIdScan {
             table,
@@ -839,16 +954,18 @@ pub fn build_with(plan: &Plan, pool: &mut BufferPool, budget: usize) -> Result<O
                     low.as_deref(),
                     high.as_deref(),
                 )?,
+                snapshot,
+                last: None,
             }
         }
         Plan::NestedLoopJoin { left, right, on } => {
-            let mut inner = build_with(right, pool, budget)?;
+            let mut inner = build_with(right, pool, snapshot, budget)?;
             let mut rows = Vec::new();
             while let Some(row) = inner.next(pool)? {
                 rows.push(row);
             }
             Op::NestedLoopJoin {
-                left: Box::new(build_with(left, pool, budget)?),
+                left: Box::new(build_with(left, pool, snapshot, budget)?),
                 right: rows,
                 on: on.clone(),
                 current: None,
@@ -862,8 +979,8 @@ pub fn build_with(plan: &Plan, pool: &mut BufferPool, budget: usize) -> Result<O
             right_key,
             residual,
         } => Op::HashJoin {
-            left: Box::new(build_with(left, pool, budget)?),
-            right: Box::new(build_with(right, pool, budget)?),
+            left: Box::new(build_with(left, pool, snapshot, budget)?),
+            right: Box::new(build_with(right, pool, snapshot, budget)?),
             left_key: left_key.clone(),
             right_key: right_key.clone(),
             residual: residual.clone(),
@@ -881,18 +998,20 @@ pub fn build_with(plan: &Plan, pool: &mut BufferPool, budget: usize) -> Result<O
                     Some(&prefix),
                     upper.as_deref(),
                 )?,
+                snapshot,
+                seen: std::collections::HashSet::new(),
             }
         }
         Plan::Filter { input, predicate } => Op::Filter {
-            input: Box::new(build_with(input, pool, budget)?),
+            input: Box::new(build_with(input, pool, snapshot, budget)?),
             predicate: predicate.clone(),
         },
         Plan::Project { input, exprs, .. } => Op::Project {
-            input: Box::new(build_with(input, pool, budget)?),
+            input: Box::new(build_with(input, pool, snapshot, budget)?),
             exprs: exprs.clone(),
         },
         Plan::Sort { input, keys, top } => Op::Sort {
-            input: Box::new(build_with(input, pool, budget)?),
+            input: Box::new(build_with(input, pool, snapshot, budget)?),
             keys: keys.clone(),
             top: *top,
             budget: budget.max(1),
@@ -906,7 +1025,7 @@ pub fn build_with(plan: &Plan, pool: &mut BufferPool, budget: usize) -> Result<O
             limit,
             offset,
         } => Op::Limit {
-            input: Box::new(build_with(input, pool, budget)?),
+            input: Box::new(build_with(input, pool, snapshot, budget)?),
             remaining: *limit,
             skip: *offset,
         },
@@ -983,60 +1102,57 @@ fn rowid_of(key: &[u8]) -> Result<i64> {
     Ok(decode_i64(bytes))
 }
 
-/// Adds one row to every index on its table.
-fn index_row(pool: &mut BufferPool, table: &TableSchema, row: &[Value], rowid: i64) -> Result<()> {
-    for index in &table.indexes {
-        if index.unique {
-            let values: Vec<Value> = index
-                .columns
-                .iter()
-                .map(|position| row[*position].clone())
-                .collect();
-            // A null is not equal to anything, not even another null, so it
-            // cannot collide and a unique index lets any number of them in.
-            if !values.iter().any(|value| matches!(value, Value::Null))
-                && index_holds(pool, index, &values, rowid)?
-            {
-                return Err(Error::NotUnique(index.name.clone()));
-            }
-        }
-        let mut tree = BTree::open(index.root);
-        tree.insert(pool, &index_key(index, row, rowid)?, &[])?;
-    }
-    Ok(())
-}
-
-/// Removes one row from every index on its table.
-fn unindex_row(
+/// Refuses a row that would repeat a value a unique index admits once.
+///
+/// Asks the index for candidates and then reads each row, because an index
+/// entry may point at a version nobody can see any more. A unique constraint is
+/// about what is visible, not about what is still lying on disk.
+fn check_unique(
     pool: &mut BufferPool,
     table: &TableSchema,
     row: &[Value],
     rowid: i64,
+    snapshot: Snapshot,
 ) -> Result<()> {
+    let types = column_types(table);
     for index in &table.indexes {
-        let mut tree = BTree::open(index.root);
-        tree.delete(pool, &index_key(index, row, rowid)?)?;
+        if !index.unique {
+            continue;
+        }
+        let values = index_values(index, row);
+        // A null is not equal to anything, not even another null, so it cannot
+        // collide and a unique index lets any number of them in.
+        if values.iter().any(|value| matches!(value, Value::Null)) {
+            continue;
+        }
+
+        let prefix = index_prefix(&values)?;
+        let upper = successor(&prefix);
+        let tree = BTree::open(index.root);
+        let mut cursor = tree.cursor_range(pool, Some(&prefix), upper.as_deref())?;
+        while let Some((key, _)) = cursor.next(pool)? {
+            let other = rowid_of(&key)?;
+            if other == rowid {
+                continue;
+            }
+            let Some(existing) = fetch_visible(pool, table.root, other, &types, snapshot)? else {
+                continue;
+            };
+            if index_values(index, &existing) == values {
+                return Err(Error::NotUnique(index.name.clone()));
+            }
+        }
     }
     Ok(())
 }
 
-/// Whether an index already holds `values` under some row other than `rowid`.
-fn index_holds(
-    pool: &mut BufferPool,
-    index: &IndexSchema,
-    values: &[Value],
-    rowid: i64,
-) -> Result<bool> {
-    let prefix = index_prefix(values)?;
-    let upper = successor(&prefix);
-    let tree = BTree::open(index.root);
-    let mut cursor = tree.cursor_range(pool, Some(&prefix), upper.as_deref())?;
-    while let Some((key, _)) = cursor.next(pool)? {
-        if rowid_of(&key)? != rowid {
-            return Ok(true);
-        }
+/// Adds one row to every index on its table.
+fn index_row(pool: &mut BufferPool, table: &TableSchema, row: &[Value], rowid: i64) -> Result<()> {
+    for index in &table.indexes {
+        let mut tree = BTree::open(index.root);
+        tree.insert(pool, &index_key(index, row, rowid)?, &[])?;
     }
-    Ok(false)
+    Ok(())
 }
 
 /// Builds an index over the rows a table already holds.
@@ -1044,49 +1160,45 @@ pub fn build_index(
     pool: &mut BufferPool,
     table: &TableSchema,
     index: &IndexSchema,
+    snapshot: Snapshot,
 ) -> Result<usize> {
     let types = column_types(table);
     let mut entries = Vec::new();
     {
         let tree = BTree::open(table.root);
         let mut cursor = tree.cursor(pool, None)?;
-        while let Some((key, encoded)) = cursor.next(pool)? {
-            let row = decode_tuple(&encoded, &types)
-                .ok_or_else(|| Error::MalformedFile("a row that does not decode".into()))?;
-            let mut rowid_bytes = [0u8; 8];
-            rowid_bytes.copy_from_slice(&key);
-            entries.push((decode_i64(rowid_bytes), row));
+        let mut last: Option<i64> = None;
+        while let Some((key, value)) = cursor.next(pool)? {
+            let (rowid, xmin) = split_row_key(&key)?;
+            if last == Some(rowid) {
+                continue;
+            }
+            let (xmax, row) = decode_version(&value, &types)?;
+            if snapshot.sees(Version { xmin, xmax }) {
+                last = Some(rowid);
+                entries.push((rowid, row));
+            }
         }
     }
 
     let mut tree = BTree::open(index.root);
+    let mut seen: std::collections::HashMap<Vec<u8>, i64> = std::collections::HashMap::new();
     for (rowid, row) in &entries {
         if index.unique {
             let values = index_values(index, row);
-            // The rows arrive in row id order, not index order, so a duplicate
-            // need not be adjacent to its twin. Asking the half built tree
-            // catches it wherever it sits.
-            if !values.iter().any(|value| matches!(value, Value::Null))
-                && index_holds(pool, index, &values, *rowid)?
-            {
-                return Err(Error::NotUnique(index.name.clone()));
+            if !values.iter().any(|value| matches!(value, Value::Null)) {
+                let prefix = index_prefix(&values)?;
+                // The rows arrive in row id order, not index order, so a
+                // duplicate need not be adjacent to its twin. Remembering what
+                // has gone in catches it wherever it sits.
+                if seen.insert(prefix, *rowid).is_some() {
+                    return Err(Error::NotUnique(index.name.clone()));
+                }
             }
         }
         tree.insert(pool, &index_key(index, row, *rowid)?, &[])?;
     }
     Ok(entries.len())
-}
-
-/// The row id a table key is, as opposed to the one an index key ends with.
-fn rowid_of_row_key(key: &[u8]) -> Result<i64> {
-    if key.len() != 8 {
-        return Err(Error::MalformedFile(
-            "a table key that is not a row id".into(),
-        ));
-    }
-    let mut bytes = [0u8; 8];
-    bytes.copy_from_slice(key);
-    Ok(decode_i64(bytes))
 }
 
 fn index_values(index: &IndexSchema, row: &[Value]) -> Vec<Value> {
@@ -1104,28 +1216,41 @@ fn index_values(index: &IndexSchema, row: &[Value]) -> Vec<Value> {
 /// is being rewritten underneath it. Reading the whole match set first costs
 /// memory proportional to what the statement touches and removes the hazard
 /// entirely.
+///
+/// Only the version each row shows to `snapshot` is returned, so a write sees
+/// exactly what a read would.
 fn gather(
     pool: &mut BufferPool,
     table: &TableSchema,
     filter: Option<&PlanExpr>,
     lower: Option<Bound>,
     upper: Option<Bound>,
-) -> Result<Vec<(Vec<u8>, Row)>> {
+    snapshot: Snapshot,
+) -> Result<Vec<(i64, TxId, Row)>> {
     let types = column_types(table);
     let tree = BTree::open(table.root);
     let (low, high) = encode_bounds(lower, upper);
     let mut cursor = tree.cursor_range(pool, low.as_deref(), high.as_deref())?;
 
     let mut matched = Vec::new();
-    while let Some((key, encoded)) = cursor.next(pool)? {
-        let row = decode_tuple(&encoded, &types)
-            .ok_or_else(|| Error::MalformedFile("a row that does not decode".into()))?;
+    let mut last: Option<i64> = None;
+    while let Some((key, value)) = cursor.next(pool)? {
+        let (rowid, xmin) = split_row_key(&key)?;
+        if last == Some(rowid) {
+            continue;
+        }
+        let (xmax, row) = decode_version(&value, &types)?;
+        if !snapshot.sees(Version { xmin, xmax }) {
+            continue;
+        }
+        last = Some(rowid);
+
         let admitted = match filter {
             Some(predicate) => truth(&eval(predicate, &row)?) == Some(true),
             None => true,
         };
         if admitted {
-            matched.push((key, row));
+            matched.push((rowid, xmin, row));
         }
     }
     Ok(matched)
@@ -1138,44 +1263,63 @@ fn encode_bounds(lower: Option<Bound>, upper: Option<Bound>) -> (Option<Vec<u8>>
         } else {
             bound.value.saturating_add(1)
         };
-        encode_i64(value).to_vec()
+        row_key_floor(value)
     });
-    // The upper edge of a cursor is exclusive, so an inclusive bound is one
-    // past the value it names.
+    // The upper edge of a cursor is exclusive, so an inclusive bound is the
+    // floor of the row id one past the one it names.
     let high = upper.map(|bound| {
         let value = if bound.inclusive {
             bound.value.saturating_add(1)
         } else {
             bound.value
         };
-        encode_i64(value).to_vec()
+        row_key_floor(value)
     });
     (low, high)
 }
 
-/// Removes every row the filter admits, returning how many went.
+/// What a write reads through, and what it stamps versions with.
+///
+/// Carried as one thing because the two always travel together: a write reads
+/// the versions its own transaction can see, and writes versions marked with
+/// that same transaction.
+#[derive(Debug, Clone, Copy)]
+pub struct Writer {
+    /// The versions this write is allowed to see.
+    pub snapshot: Snapshot,
+    /// The transaction doing the writing.
+    pub txid: TxId,
+}
+
+/// Marks every row the filter admits as removed, returning how many went.
+///
+/// Nothing is erased. The version is stamped with the transaction that removed
+/// it and stays where it is, so a reader that started earlier still finds it.
 pub fn delete(
     pool: &mut BufferPool,
     table: &TableSchema,
     filter: Option<&PlanExpr>,
     lower: Option<Bound>,
     upper: Option<Bound>,
+    writer: Writer,
 ) -> Result<usize> {
-    let matched = gather(pool, table, filter, lower, upper)?;
+    let matched = gather(pool, table, filter, lower, upper, writer.snapshot)?;
     let mut tree = BTree::open(table.root);
-    for (key, row) in &matched {
-        unindex_row(pool, table, row, rowid_of_row_key(key)?)?;
-        tree.delete(pool, key)?;
+    for (rowid, xmin, row) in &matched {
+        tree.insert(
+            pool,
+            &row_key(*rowid, *xmin),
+            &encode_version(writer.txid, row),
+        )?;
     }
     Ok(matched.len())
 }
 
 /// Applies the assignments to every row the filter admits.
 ///
-/// A change to the primary key moves the row, because the primary key is the
-/// key of the table own tree. That is a removal and a fresh write rather than
-/// an edit in place, and the order matters: writing first and removing after
-/// would delete the row that had just been written.
+/// An update is a removal and an insertion: the version that was there is
+/// stamped as removed and a new one is written beside it. Both stay, and which
+/// one a reader finds depends on when the reader started.
 pub fn update(
     pool: &mut BufferPool,
     table: &TableSchema,
@@ -1183,12 +1327,13 @@ pub fn update(
     filter: Option<&PlanExpr>,
     lower: Option<Bound>,
     upper: Option<Bound>,
+    writer: Writer,
 ) -> Result<usize> {
-    let matched = gather(pool, table, filter, lower, upper)?;
+    let matched = gather(pool, table, filter, lower, upper, writer.snapshot)?;
     let rowid_column = table.rowid_column();
     let mut tree = BTree::open(table.root);
 
-    for (key, row) in &matched {
+    for (rowid, xmin, row) in &matched {
         let mut updated = row.clone();
         for (index, value) in assignments {
             let column = table.column(*index);
@@ -1201,26 +1346,27 @@ pub fn update(
             }
         }
 
-        let new_key = match rowid_column {
+        let new_rowid = match rowid_column {
             Some(index) => match updated[index] {
-                Value::Int(number) => encode_i64(number).to_vec(),
+                Value::Int(number) => number,
                 // Anything else was already refused by the coercion above,
                 // unless it was null, which the check above catches.
                 _ => return Err(Error::NotNull(table.column(index).name.clone())),
             },
-            None => key.clone(),
+            None => *rowid,
         };
 
-        let mut encoded = Vec::new();
-        encode_tuple(&updated, &mut encoded);
-
-        let old_rowid = rowid_of_row_key(key)?;
-        let new_rowid = rowid_of_row_key(&new_key)?;
-        unindex_row(pool, table, row, old_rowid)?;
-        if new_key != *key {
-            tree.delete(pool, key)?;
-        }
-        tree.insert(pool, &new_key, &encoded)?;
+        check_unique(pool, table, &updated, new_rowid, writer.snapshot)?;
+        tree.insert(
+            pool,
+            &row_key(*rowid, *xmin),
+            &encode_version(writer.txid, row),
+        )?;
+        tree.insert(
+            pool,
+            &row_key(new_rowid, writer.txid),
+            &encode_version(0, &updated),
+        )?;
         index_row(pool, table, &updated, new_rowid)?;
     }
     Ok(matched.len())
@@ -1232,6 +1378,7 @@ pub fn insert(
     table: &TableSchema,
     targets: &[usize],
     rows: &[Vec<PlanExpr>],
+    writer: Writer,
 ) -> Result<usize> {
     let mut tree = BTree::open(table.root);
     let rowid_column = table.rowid_column();
@@ -1240,11 +1387,7 @@ pub fn insert(
     // of the tree, rather than kept as a counter the catalog has to rewrite on
     // every insert.
     let mut next_auto = match tree.last_key(pool)? {
-        Some(key) if key.len() == 8 => {
-            let mut bytes = [0u8; 8];
-            bytes.copy_from_slice(&key);
-            crate::storage::page::encoding::decode_i64(bytes).saturating_add(1)
-        }
+        Some(key) if key.len() == ROW_KEY_LEN => split_row_key(&key)?.0.saturating_add(1),
         _ => 1,
     };
 
@@ -1285,9 +1428,12 @@ pub fn insert(
             }
         }
 
-        let mut encoded = Vec::new();
-        encode_tuple(&values, &mut encoded);
-        tree.insert(pool, &encode_i64(rowid), &encoded)?;
+        check_unique(pool, table, &values, rowid, writer.snapshot)?;
+        tree.insert(
+            pool,
+            &row_key(rowid, writer.txid),
+            &encode_version(0, &values),
+        )?;
         index_row(pool, table, &values, rowid)?;
     }
     Ok(rows.len())
