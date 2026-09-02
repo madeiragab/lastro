@@ -37,6 +37,8 @@ pub enum Statement {
 /// A query.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    /// Whether duplicate output rows are collapsed into one.
+    pub distinct: bool,
     /// What comes out.
     pub projection: Projection,
     /// The table it reads from.
@@ -437,6 +439,9 @@ impl fmt::Display for Statement {
 impl fmt::Display for Select {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SELECT ")?;
+        if self.distinct {
+            write!(f, "DISTINCT ")?;
+        }
         match &self.projection {
             Projection::Star => write!(f, "*")?,
             Projection::Items(items) => {
