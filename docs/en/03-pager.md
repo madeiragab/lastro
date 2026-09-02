@@ -152,6 +152,12 @@ impl Drop for PageGuard<'_> {
 This is one of the places where choosing Rust pays for itself: the pin leak, which in C would be
 a discipline bug, becomes structurally impossible.
 
+**Implementation status.** The `Drop`-based `PageGuard` needs interior mutability in the pool,
+which arrives with the WAL layer. Until then a pin is a `PinnedPage` token that must be handed
+back to `unpin`. The token is neither `Copy` nor `Clone`, so it cannot be duplicated by accident,
+and `BufferPool::check_invariants` fails if any pin is still outstanding at the end of an
+operation — the leak surfaces at the operation that caused it, which is the part that matters.
+
 ---
 
 ## Invariants
