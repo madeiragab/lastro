@@ -248,6 +248,37 @@ exatamente o comportamento correto, obtido sem nenhum código específico de MVC
 
 ---
 
+### Estado da implementação
+
+Implementado: cabeçalho de versão com `xmin` e `xmax`, snapshot tirado no `BEGIN`
+e segurado até o fim, a regra de visibilidade completa com tabela verdade em
+teste, e `INSERT`, `UPDATE` e `DELETE` criando versões em vez de sobrescrever.
+
+**A pergunta "quem escreveu isso já tinha commitado" não precisa de tabela de
+status aqui.** O motor aceita um escritor por vez, e uma transação que aborta tem
+as versões desfeitas pelo log, não deixadas para trás. Então qualquer versão
+ainda no disco foi escrita ou por alguém que commitou, ou pela única transação
+aberta — e o snapshot já sabe qual é. É uma simplificação comprada pela escolha
+de escritor único, e deixa de valer no instante em que existir um segundo
+escritor.
+
+**Detecção de conflito de escrita** (*first-updater-wins*) também não está
+implementada, pelo mesmo motivo: com um escritor por vez não existe segunda
+transação para conflitar. Vira necessária junto com o segundo escritor.
+
+**A coleta de versões mortas não existe.** Uma remoção não devolve páginas: a
+versão removida guarda os bytes para que um leitor que começou antes ainda a
+encontre. Recuperar esse espaço é trabalho do vacuum, e ele é o que falta desta
+etapa.
+
+**Um índice pode ficar desatualizado de propósito.** A entrada não é removida
+quando a versão é substituída, então ela pode apontar para uma linha cuja versão
+visível não casa mais. O planner mantém a igualdade no filtro acima por isso, e a
+busca confere visibilidade antes de devolver a linha. Sai mais barato que manter
+o índice exato, e o que se paga é uma entrada morta até o vacuum.
+
+---
+
 ## Critério de pronto
 
 - Tabela verdade completa da regra de visibilidade em teste fixo, com todas as combinações de
