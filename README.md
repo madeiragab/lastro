@@ -20,13 +20,14 @@ número só entra depois de medido.
 | Camada | Estado |
 |---|---|
 | Especificação e documentação | concluída |
+| Etapas 0 a 3 do roadmap | concluídas |
 | Formato de arquivo, slotted page, codificações | concluído |
 | Pager e freelist | concluído |
 | Buffer pool com política clock | concluído |
 | B+Tree | concluído |
 | WAL: formato do registro, regra WAL, recovery ARIES | concluído |
 | B+Tree transacional sobre o log | concluído |
-| Crash fuzzer | não começado |
+| Crash fuzzer | concluído |
 | SQL (parser, planner, executor) | não começado |
 | MVCC / snapshot isolation | não começado |
 | Suíte de provas | parcial: modelo e propriedade prontos, crash fuzzer não |
@@ -154,6 +155,28 @@ cargo run --bin lastro-cli -- page exemplo.lastro 1
 Nenhum número entra aqui sem ter sido medido, com o comando ao lado. Metodologia completa em
 [08 · Testes e provas](docs/pt/08-testes.md).
 
+**Durabilidade** — o crash fuzzer. A energia é cortada no n-ésimo ponto de sincronização e a
+varredura passa por todos eles. Depois de cada corte o banco é reaberto por inteiro e verificado.
+
+| Métrica | Valor |
+|---|---|
+| Sementes por execução da integração contínua | 120 |
+| Sementes na execução diária | 20.000, em 8min27s |
+| Pontos de sincronização varridos exaustivamente | todos, em uma carga completa |
+| Violações de atomicidade | 0 |
+
+Reproduzir: `LASTRO_FUZZ_SEEDS=20000 cargo test --release --test crash_fuzz`. Toda semente que
+falhar imprime a semente e o ponto de corte, e vira teste fixo.
+
+A propriedade verificada, com precisão: **depois do recovery o banco está em um estado
+correspondente a algum prefixo da sequência de commits confirmados.** Nem um commit a mais, nem
+um a menos, nem estado intermediário nenhum.
+
+Por que perda de energia e não `SIGKILL`: um processo morto perde os próprios buffers, mas toda
+escrita que já chegou ao sistema operacional continua no cache e é gravada depois de qualquer
+jeito. O dado sobrevive, a regra WAL nunca é pressionada, e o teste passa exista a regra ou não.
+O que está modelado é o que de fato importa — **só o que passou por `fsync` sobrevive.**
+
 **Compatibilidade** — a suíte SQL Logic Test do SQLite, escrita por terceiros, rodada contra o
 subconjunto de SQL implementado aqui.
 
@@ -184,6 +207,25 @@ o que explica por quê.
 ## Diário de bugs
 
 Registro dos erros que custaram caro, porque é a parte que de fato ensinou alguma coisa.
+
+### A página de metadados que descia antes das outras
+
+Achado pelo crash fuzzer na primeira execução, o que é o melhor argumento possível a favor de
+escrever o fuzzer.
+
+Ao sincronizar, as páginas pendentes eram gravadas em ordem de número. A página de metadados é a
+número zero, então ela chegava ao disco **primeiro** — contando páginas que ainda não tinham
+chegado. A abertura seguinte encontrava um arquivo com três páginas e metadados afirmando cinco,
+e recusava o banco.
+
+A regra que faltava é simples e vale para qualquer coisa que aponte para outra: **o que
+referencia desce depois do que é referenciado.** Agora a página de metadados vai por último, e só
+se todas as outras passarem.
+
+Junto veio uma segunda coisa, que não é bug e sim rigidez indevida: a abertura recusava um
+arquivo mais curto do que os metadados afirmam. Depois de uma queda isso é normal, não é
+corrupção. As páginas que faltam ficam em branco e o recovery preenche o que o log tiver a dizer
+sobre elas.
 
 ### O redo que pulava tudo, em silêncio
 
