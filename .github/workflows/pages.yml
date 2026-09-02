@@ -7,7 +7,11 @@ name: site
 
 on:
   push:
-    branches: [main, "feat/**"]
+    branches: [main]
+  # A pull request builds the site but does not publish it, so a change that
+  # breaks the WebAssembly build is caught before it reaches the published page.
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
