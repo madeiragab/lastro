@@ -160,6 +160,21 @@ tabela é onde o redo vai começar, e é o que impede o recovery de reler o log 
 
 Disparo: a cada 64 MB de log escrito, ou a cada 30 segundos, o que vier primeiro.
 
+### Desvio na implementação: checkpoint sharp, não fuzzy
+
+O checkpoint implementado **para o mundo** enquanto roda: força todas as páginas sujas ao disco,
+sincroniza o arquivo de dados, e então trunca o log a zero. Não existem registros
+`CHECKPOINT_BEGIN` e `CHECKPOINT_END` — não são necessários quando o log é esvaziado, porque o
+recovery sempre começa do byte zero de um log curto.
+
+O que se perde: sob carga, o banco fica parado durante o checkpoint. O que se ganha: a fase de
+análise não precisa reconstruir tabela de transações ativas nem tabela de páginas sujas a partir
+de um ponto de checkpoint, porque não há nada antes dele. Menos código, menos a errar, e o
+limite de tempo do recovery continua sendo a frequência do checkpoint.
+
+O checkpoint fuzzy é a evolução natural e está registrada como trabalho futuro, não como
+omissão.
+
 ---
 
 ## Recovery: as três fases
