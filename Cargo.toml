@@ -10,9 +10,12 @@ readme = "README.md"
 keywords = ["database", "storage-engine", "btree", "wal"]
 categories = ["database-implementations"]
 
-# The library itself has no dependencies. Everything below the SQL layer is
-# written from scratch, including CRC32C and the varint codec.
+# Everything below the SQL layer is written from scratch, including CRC32C and
+# the varint codec. The one dependency is `tempfile`, and only because an
+# external sort has to put its runs somewhere, and creating a file that goes
+# away when it is closed is a platform question rather than a database one.
 [dependencies]
+tempfile = "3"
 
 [dev-dependencies]
 proptest = "1"
