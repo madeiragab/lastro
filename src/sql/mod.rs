@@ -7,8 +7,9 @@
 //! Each arrow is a transformation between data structures, testable on its own.
 //! The parser never touches disk. See `docs/en/06-sql.md`.
 //!
-//! Implemented so far: the lexer, the AST and the parser. The binder, planner
-//! and executor come next.
+//! Implemented so far: `CREATE TABLE`, `INSERT`, `SELECT` over one table with
+//! `WHERE`, `ORDER BY` and `LIMIT`, and `EXPLAIN`. Joins, secondary indexes,
+//! `UPDATE` and `DELETE` come next.
 //!
 //! ```
 //! use lastro::sql::{parse, Statement};
@@ -23,13 +24,21 @@
 //! ```
 
 pub mod ast;
+pub mod catalog;
+pub mod engine;
+pub mod exec;
 pub mod lexer;
 pub mod parser;
+pub mod plan;
 
 pub use ast::{
     BinaryOp, ColumnConstraint, ColumnDef, CreateIndex, CreateTable, DataType, Delete, Expr,
     Insert, Join, Literal, OrderItem, ProjItem, Projection, Select, Statement, TableRef, UnaryOp,
     Update,
 };
+pub use catalog::{Catalog, ColumnSchema, TableSchema};
+pub use engine::{Database, Outcome};
+pub use exec::Row;
 pub use lexer::{tokenize, Keyword, Token, TokenKind};
 pub use parser::{parse, parse_many};
+pub use plan::{Plan, PlanExpr};

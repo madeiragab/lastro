@@ -7,4 +7,4 @@
 pub mod btree;
 pub mod node;
 
-pub use btree::{BTree, Entry, TreeStats};
+pub use btree::{BTree, Cursor, Entry, TreeStats};
