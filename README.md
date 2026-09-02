@@ -31,8 +31,10 @@ número só entra depois de medido.
 | SQL: lexer, árvore sintática, parser | concluído |
 | SQL: catálogo, binder, planner, executor | concluído |
 | SQL: junções, índices secundários, UPDATE, DELETE | concluído |
-| MVCC / snapshot isolation | não começado |
-| Suíte de provas | parcial: modelo e propriedade prontos, crash fuzzer não |
+| MVCC: versão de linha, snapshot, regra de visibilidade | concluído |
+| MVCC: coleta de versões mortas | não começado |
+| Provas: modelo, propriedade, crash fuzzer | concluído |
+| Provas: sqllogictest, bateria de anomalias, benchmark | não começado |
 
 O que já roda: criar e abrir um arquivo `.lastro`, alocar e liberar páginas com reuso pela
 freelist, guardar células de tamanho variável em slotted pages com compactação, um índice B+Tree
@@ -277,6 +279,34 @@ Junto veio uma segunda coisa, que não é bug e sim rigidez indevida: a abertura
 arquivo mais curto do que os metadados afirmam. Depois de uma queda isso é normal, não é
 corrupção. As páginas que faltam ficam em branco e o recovery preenche o que o log tiver a dizer
 sobre elas.
+
+### O nascimento de uma página que ninguém escreveu no log
+
+O melhor achado desta rodada, e o mais bem escondido.
+
+Montar uma página escreve o byte que diz o que ela é: folha, nó interior, heap.
+Esse byte é escrito **uma vez**, na montagem, e nunca mais — nenhuma inserção,
+remoção ou split volta a tocá-lo.
+
+E `BTree::create` montava a página raiz **fora de qualquer sessão de edição**.
+A montagem não virava registro no log.
+
+O que acontecia então: as inserções seguintes eram logadas normalmente, e o diff
+de cada uma cobria os bytes que mudaram — contagem de slots, ponteiros de espaço
+livre, a célula nova. O byte de tipo não estava em nenhum diff, porque ele era o
+mesmo antes e depois. Depois de uma queda, o redo reconstruía o conteúdo da
+página **sobre uma página que nunca soube o que era**, e a árvore encontrava tipo
+nenhum na própria raiz.
+
+O que faz esse ser instrutivo: o esquema de "logar só o que mudou" está correto,
+e mesmo assim perde informação — porque *nunca ter mudado* e *nunca ter sido
+escrito* são coisas diferentes, e o diff não distingue. A regra que faltava é que
+**tudo que uma página é precisa passar pelo log, inclusive o instante em que ela
+passou a existir.**
+
+Junto veio uma segunda coisa: `begin_edit` agora diz se abriu a sessão, para que
+quem encontra uma já aberta deixe para quem a abriu. Fechar sessão alheia mais
+cedo logaria meia operação e chamaria de inteira.
 
 ### O redo que pulava tudo, em silêncio
 

@@ -248,6 +248,37 @@ correct behaviour, obtained with no MVCC-specific code in recovery at all.
 
 ---
 
+### Implementation status
+
+Implemented: the version header with `xmin` and `xmax`, a snapshot taken at
+`BEGIN` and held to the end, the full visibility rule with its truth table as a
+test, and `INSERT`, `UPDATE` and `DELETE` creating versions rather than
+overwriting.
+
+**The question "had whoever wrote this committed" needs no status table here.**
+The engine takes one writer at a time, and a transaction that rolls back has its
+versions undone by the log rather than left behind. So any version still on disk
+was written either by somebody who committed or by the one open transaction — and
+the snapshot already knows which that is. It is a simplification bought by the
+single-writer choice, and it stops being sound the moment a second writer exists.
+
+**Write conflict detection** (*first-updater-wins*) is not implemented either,
+for the same reason: with one writer at a time there is no second transaction to
+conflict with. It becomes necessary alongside the second writer.
+
+**Dead version collection does not exist.** A delete gives no pages back: the
+removed version keeps its bytes so a reader that started earlier still finds it.
+Reclaiming that space is the vacuum's job, and it is what this stage is missing.
+
+**An index is allowed to go stale on purpose.** An entry is not removed when its
+version is superseded, so it may point at a row whose visible version no longer
+matches. The planner keeps the equality in the filter above for exactly that
+reason, and the fetch checks visibility before handing the row back. It is
+cheaper than keeping the index exact, and what it costs is a dead entry until the
+vacuum runs.
+
+---
+
 ## Definition of done
 
 - Complete visibility truth table as a fixed test, covering all `xmin`/`xmax` combinations
