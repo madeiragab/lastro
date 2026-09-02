@@ -1404,3 +1404,58 @@ fn unary_plus_is_accepted_and_means_nothing() {
     let both = rows(&mut db, "SELECT + n * - n FROM t");
     assert_eq!(both[0][0], Value::Int(-49));
 }
+
+#[test]
+fn order_by_an_ordinal_names_an_output_column() {
+    // `ORDER BY 1` is the first output column, not the constant one. Sorting
+    // by a constant is a no-op, so getting this wrong returns every correct
+    // value in the wrong order and reports nothing.
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+         INSERT INTO t VALUES (1, 3, 30), (2, 1, 10), (3, 2, 20);",
+    )
+    .unwrap();
+
+    let out = rows(&mut db, "SELECT a, b FROM t ORDER BY 1");
+    assert_eq!(
+        out.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+        vec![Value::Int(1), Value::Int(2), Value::Int(3)]
+    );
+
+    let by_second = rows(&mut db, "SELECT b, a FROM t ORDER BY 2 DESC");
+    assert_eq!(
+        by_second.iter().map(|row| row[1].clone()).collect::<Vec<_>>(),
+        vec![Value::Int(3), Value::Int(2), Value::Int(1)]
+    );
+}
+
+#[test]
+fn an_ordinal_sorts_by_the_expression_the_column_is_computed_from() {
+    // The sort sits below the projection, so the key cannot be the output
+    // column: it does not exist yet.
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+         INSERT INTO t VALUES (1, 10, 1), (2, 10, 9), (3, 10, 5);",
+    )
+    .unwrap();
+
+    let out = rows(&mut db, "SELECT a - b FROM t ORDER BY 1");
+    assert_eq!(
+        out.iter().map(|row| row[0].clone()).collect::<Vec<_>>(),
+        vec![Value::Int(1), Value::Int(5), Value::Int(9)]
+    );
+}
+
+#[test]
+fn an_ordinal_past_the_last_output_column_is_refused() {
+    let (_dir, mut db) = open();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)")
+        .unwrap();
+    assert!(db.query("SELECT a FROM t ORDER BY 2").is_err());
+    assert!(db.query("SELECT a FROM t ORDER BY 0").is_err());
+    // `*` is expanded first, so an ordinal over it counts the table's columns.
+    assert!(db.query("SELECT * FROM t ORDER BY 2").is_ok());
+    assert!(db.query("SELECT * FROM t ORDER BY 3").is_err());
+}
