@@ -232,3 +232,22 @@ proptest! {
         let _ = parse(&spliced);
     }
 }
+
+#[test]
+fn distinct_survives_a_round_trip() {
+    // The rendered tree has to parse back to the same tree, or `DISTINCT` is
+    // a flag that silently disappears.
+    for sql in [
+        "SELECT DISTINCT a FROM t",
+        "SELECT DISTINCT a, b FROM t WHERE a > 1",
+        "SELECT a FROM t",
+    ] {
+        let statement = lastro::sql::parse(sql).unwrap();
+        let again = lastro::sql::parse(&statement.to_string()).unwrap();
+        assert_eq!(statement, again, "{sql} rendered as {statement}");
+    }
+
+    // `ALL` is the default, so it is not written back out.
+    let all = lastro::sql::parse("SELECT ALL a FROM t").unwrap();
+    assert_eq!(all.to_string(), "SELECT a FROM t");
+}

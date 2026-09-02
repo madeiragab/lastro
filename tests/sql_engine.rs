@@ -1270,3 +1270,137 @@ fn a_vacuum_survives_a_crash_like_any_other_write() {
     assert_eq!(rows(&mut db, "SELECT id FROM t").len(), 100);
     assert_eq!(db.query("VACUUM t").unwrap(), Outcome::Affected(0));
 }
+
+// -- what SQLite's corpus asked for ---------------------------------------
+//
+// Every test below exists because `tests/sqllogic.rs` ran SQLite's own files
+// against this engine and found the gap. That is the point of borrowing
+// somebody else's tests: they ask for things the author would not have thought
+// to ask for.
+
+#[test]
+fn distinct_collapses_duplicate_output_rows() {
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, cor TEXT);
+         INSERT INTO t VALUES (1, 'preto'), (2, 'branco'), (3, 'preto'), (4, 'branco');",
+    )
+    .unwrap();
+
+    let all = rows(&mut db, "SELECT cor FROM t");
+    assert_eq!(all.len(), 4);
+
+    let distinct = rows(&mut db, "SELECT DISTINCT cor FROM t");
+    assert_eq!(distinct.len(), 2);
+    // The order rows arrived in is kept: the collapse is a filter, not a sort.
+    assert_eq!(distinct[0][0], Value::Text("preto".into()));
+    assert_eq!(distinct[1][0], Value::Text("branco".into()));
+}
+
+#[test]
+fn distinct_is_over_the_whole_output_row() {
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+         INSERT INTO t VALUES (1, 1, 2), (2, 1, 3), (3, 1, 2);",
+    )
+    .unwrap();
+
+    assert_eq!(rows(&mut db, "SELECT DISTINCT a, b FROM t").len(), 2);
+    assert_eq!(rows(&mut db, "SELECT DISTINCT a FROM t").len(), 1);
+}
+
+#[test]
+fn two_nulls_are_one_row_to_distinct() {
+    // SQL says two nulls are not equal, and says `DISTINCT` collapses them
+    // anyway. Both are true and this is the second one.
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, peso REAL);
+         INSERT INTO t VALUES (1, NULL), (2, NULL), (3, 4.5);",
+    )
+    .unwrap();
+
+    assert_eq!(rows(&mut db, "SELECT DISTINCT peso FROM t").len(), 2);
+}
+
+#[test]
+fn all_is_the_default_written_out_loud() {
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, cor TEXT);
+         INSERT INTO t VALUES (1, 'preto'), (2, 'preto');",
+    )
+    .unwrap();
+
+    assert_eq!(rows(&mut db, "SELECT ALL cor FROM t").len(), 2);
+    assert_eq!(rows(&mut db, "SELECT cor FROM t").len(), 2);
+    assert!(!plan_of(&mut db, "SELECT ALL cor FROM t").contains("Distinct"));
+    assert!(plan_of(&mut db, "SELECT DISTINCT cor FROM t").contains("Distinct"));
+}
+
+#[test]
+fn the_collapse_happens_above_the_projection_and_below_the_limit() {
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, cor TEXT);
+         INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, 'b'), (5, 'c');",
+    )
+    .unwrap();
+
+    // A limit counts rows that survived the collapse, not rows that went in.
+    assert_eq!(rows(&mut db, "SELECT DISTINCT cor FROM t LIMIT 2").len(), 2);
+
+    let plan = plan_of(&mut db, "SELECT DISTINCT cor FROM t LIMIT 2");
+    let limit = plan.find("Limit").expect("a limit");
+    let distinct = plan.find("Distinct").expect("a collapse");
+    let project = plan.find("Project").expect("a projection");
+    assert!(limit < distinct && distinct < project, "{plan}");
+}
+
+#[test]
+fn a_column_type_is_read_by_what_it_contains() {
+    // SQLite's affinity rules, so that a schema written for SQLite is a schema
+    // this engine accepts. `VARCHAR(8)` is text because it says CHAR.
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE t (
+            pk INTEGER PRIMARY KEY,
+            nome VARCHAR(8),
+            peso FLOAT,
+            medida DOUBLE PRECISION,
+            contagem UNSIGNED BIG INT,
+            nota DECIMAL(10, 5)
+         )",
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO t VALUES (1, 'ana', 4.5, 6.25, 900, 1.5)")
+        .unwrap();
+    let out = rows(&mut db, "SELECT nome, peso, contagem FROM t");
+    assert_eq!(out[0][0], Value::Text("ana".into()));
+    assert_eq!(out[0][1], Value::Real(4.5));
+    assert_eq!(out[0][2], Value::Int(900));
+
+    // The declared width is parsed and dropped rather than enforced, because
+    // enforcing it is a promise the storage does not keep.
+    db.execute("INSERT INTO t VALUES (2, 'um nome bem mais longo que oito', 1.0, 1.0, 1, 1.0)")
+        .unwrap();
+}
+
+#[test]
+fn unary_plus_is_accepted_and_means_nothing() {
+    let (_dir, mut db) = open();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER);
+         INSERT INTO t VALUES (1, 7), (2, -7);",
+    )
+    .unwrap();
+
+    let out = rows(&mut db, "SELECT + n FROM t WHERE + id = 1");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0][0], Value::Int(7));
+
+    let both = rows(&mut db, "SELECT + n * - n FROM t");
+    assert_eq!(both[0][0], Value::Int(-49));
+}
