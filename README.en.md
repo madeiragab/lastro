@@ -4,6 +4,10 @@
 
 [![CI](https://github.com/madeiragab/lastro/actions/workflows/ci.yml/badge.svg)](https://github.com/madeiragab/lastro/actions/workflows/ci.yml)
 
+> **[Run the database in your browser](https://madeiragab.github.io/lastro/)** — the real engine compiled to
+> WebAssembly, with nothing to install. The same pager, the same B+Tree, the same log; only the
+> disk becomes a file in memory inside your tab.
+
 **An embedded relational database, written from scratch in Rust.**
 
 On-disk pages, B+Tree, write-ahead log with crash recovery, SQL parser and MVCC.

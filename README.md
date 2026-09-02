@@ -4,6 +4,10 @@
 
 [![CI](https://github.com/madeiragab/lastro/actions/workflows/ci.yml/badge.svg)](https://github.com/madeiragab/lastro/actions/workflows/ci.yml)
 
+> **[Rode o banco no navegador](https://madeiragab.github.io/lastro/)** — o motor de verdade compilado para
+> WebAssembly, sem instalar nada. O mesmo pager, a mesma B+Tree, o mesmo log; o disco é que vira
+> um arquivo em memória na sua aba.
+
 **Um banco de dados relacional embutido, escrito do zero em Rust.**
 
 Páginas em disco, B+Tree, write-ahead log com crash recovery, parser SQL e MVCC.
