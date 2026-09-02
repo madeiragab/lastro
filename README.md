@@ -34,6 +34,12 @@ Se a pergunta é quanto disto eu entendo de fato, a resposta mais honesta que eu
 [Diário de bugs](POSTMORTEM.md): cinco erros, o sintoma de cada um, por que os testes que
 existiam deixaram passar e o que ficou. Depuração não terceiriza.
 
+O quarto daquele diário nem era meu: o buffer de argumentos que estourava a partir do primeiro
+caractere acentuado é do shim WASI que a demo usa, e o sintoma apontava para o meu parser. Achar,
+isolar e mandar a correção para o upstream —
+[bjorn3/browser_wasi_shim#113](https://github.com/bjorn3/browser_wasi_shim/pull/113) — é o que
+sobra depois que a digitação sai de cena.
+
 ---
 
 ## Status

@@ -34,6 +34,12 @@ If the question is how much of this I actually understand, the most honest answe
 the [Bug diary](POSTMORTEM.en.md): five defects, the symptom of each, why the tests that
 existed let them through, and what stayed. Debugging does not outsource.
 
+The fourth one in that diary was not even mine: the argument buffer that overran from the first
+accented character belongs to the WASI shim the demo runs on, and the symptom pointed straight at
+my parser. Finding it, isolating it and sending the fix upstream —
+[bjorn3/browser_wasi_shim#113](https://github.com/bjorn3/browser_wasi_shim/pull/113) — is what is
+left once the typing is taken out.
+
 ---
 
 ## Status
