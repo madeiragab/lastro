@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use crate::storage::crash::CrashHandle;
 use crate::storage::page::{Page, PageType};
 use crate::storage::pager::Pager;
 use crate::wal::record::{PageEdit, RecordBody};
@@ -118,6 +119,23 @@ impl BufferPool {
     /// record describing it does.
     pub fn attach_wal(&mut self, wal: Wal) {
         self.wal = Some(wal);
+    }
+
+    /// Arms a simulated power loss across the pager and the log at once.
+    ///
+    /// They have to share one simulation: the whole question the crash fuzzer
+    /// asks is whether the log reached the disk before the page it describes,
+    /// and that is only meaningful if both are cut off at the same instant.
+    pub fn arm_crash_sim(&mut self, sim: CrashHandle) {
+        self.pager.arm_crash_sim(sim.clone());
+        if let Some(wal) = self.wal.as_mut() {
+            wal.arm_crash_sim(sim);
+        }
+    }
+
+    /// Whether the simulated power has been cut.
+    pub fn crashed(&self) -> bool {
+        self.pager.crashed()
     }
 
     /// The attached log, if there is one.
