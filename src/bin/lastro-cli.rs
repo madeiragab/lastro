@@ -18,6 +18,7 @@ lastro-cli — inspect a lastro database
 
 usage:
     lastro-cli sql <file> <statements>   run SQL and print the result
+    lastro-cli sql <file> -              read the statements from stdin
     lastro-cli create <file>             create an empty database
     lastro-cli info <file>               print the metadata page
     lastro-cli pages <file>              summarize every page
@@ -56,7 +57,25 @@ fn main() -> ExitCode {
 }
 
 /// Runs statements and prints whatever they produce.
+///
+/// `-` in place of the statements reads them from standard input, which is the
+/// usual convention and is also the only way to hand this tool a script that
+/// does not fit — or survive — an argument. The browser build depends on it:
+/// the WASI shim it runs under sizes the argument buffer in UTF-16 code units
+/// and then fills it with UTF-8 bytes, so a single accented character in a
+/// comment overruns the buffer and corrupts whatever is next in memory. Reading
+/// the bytes from a file descriptor sidesteps the whole question.
 fn sql(path: &str, statements: &str) -> Result<()> {
+    let script;
+    let statements = if statements == "-" {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+        script = text;
+        script.as_str()
+    } else {
+        statements
+    };
+
     let mut db = Database::open(path)?;
     for outcome in db.execute(statements)? {
         match outcome {
