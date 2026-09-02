@@ -542,10 +542,15 @@ impl BufferPool {
     ///
     /// A no-op when there is no log or no open transaction, which is what lets
     /// every caller run the same code whether or not it is being logged.
-    pub fn begin_edit(&mut self) {
+    /// Returns whether it opened one, so a caller that finds a session already
+    /// running leaves it to whoever started it. Closing somebody else's session
+    /// early would log half an operation and call it whole.
+    pub fn begin_edit(&mut self) -> bool {
         if self.wal.is_some() && self.txn.is_some() && self.edit.is_none() {
             self.edit = Some(HashMap::new());
+            return true;
         }
+        false
     }
 
     /// Closes the session, logging the smallest edit that describes each page.
