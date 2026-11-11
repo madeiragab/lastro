@@ -20,7 +20,7 @@ linha por linha, o que um banco de dados faz entre o seu `INSERT` e o dado estar
 ## Como este projeto foi escrito
 
 Escrito com assistência de IA, em sessões longas, com revisão minha camada por camada. O
-histórico do repositório não esconde: os commits saem rápido e carregam `Co-Authored-By`.
+histórico do repositório não esconde: os commits saem rápido.
 
 Vale dizer o que a assistência **não** decidiu, porque é o que sobra quando se tira a
 digitação. A especificação — formato binário, formato do registro de log, as invariantes de

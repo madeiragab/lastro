@@ -20,7 +20,7 @@ line, what a database does between your `INSERT` and the data being safe on disk
 ## How this project was written
 
 Written with AI assistance, in long sessions, reviewed by me layer by layer. The repository
-history does not hide it: commits come out fast and carry `Co-Authored-By`.
+history does not hide it: commits come out fast.
 
 Worth saying what the assistance did **not** decide, because that is what remains once the
 typing is taken out. The specification — binary file format, log record format, the invariants
